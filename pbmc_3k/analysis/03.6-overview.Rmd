@@ -1,0 +1,1041 @@
+---
+title: "Protein expression for pbmc"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+library(CSCORE)
+library(WGCNA)
+library(ggpubr)
+library(ggvenn)
+
+library(SAVER)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+# Overview
+
+The overaching goal of this project is assess different ways of identifying novel co-expressed gene pairs from single-cell RNA-seq datasets. We know that correlations based solely on the normalized RNA expression is not sufficient due to problems with dropout. To address each of these problems we have been working with a variety of different tools. 
+
+The purposes of this report is to pull together all of the tools into one workflow and assess which tools are working best.
+
+The general workflow is:
+
+1. Normalization/imputation
+  - We use the raw RNA counts to get a normalized count matrix with these methods:
+      1. SCT
+      2. MAGIC
+      3. SAVER
+2. Correlation/Co-expression
+  - With these normalized and imputed matrices we can compute spearman correlations on the corrected dataset (resulting in 3 correlation matrices)
+  - We supply the raw RNA counts to CS-CORE which will provide a 
+3. WGCNA
+  - We can generate gene modules by inputting each co-expression matrix into WGCNA
+
+Next we will quantify how well each approach works with the following metrics:
+
+4. Positive and negative controls
+5. Consensus across methods
+6. Example of finding new co-expressed genes
+
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes: pbmc_3k"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+A brief overview of what the dataset looks like:
+
+```{r}
+# Load dataset
+# remotes::install_github("mojaveazure/seurat-disk", quiet=F)
+library(SeuratDisk)
+load(bzfile("../data/seurat_integrated.RData.bz2"))
+
+seurat <- seurat_integrated
+DefaultAssay(seurat) <- "RNA"
+seurat[["SCT"]] <- NULL
+seurat[["integrated"]] <- NULL
+
+rm(seurat_integrated)
+```
+
+```{r}
+Idents(object = seurat) <- "integrated_snn_res.0.8"
+
+seurat <- RenameIdents(object = seurat, 
+                               "0" = "Naive or memory CD4+ T cells",
+                               "1" = "CD14+ monocytes",
+                               "2" = "Activated T cells",
+                               "3" = "CD14+ monocytes",
+                               "4" = "Stressed cells / Unknown",
+                               "5" = "CD8+ T cells",
+                               "6" = "Naive or memory CD4+ T cells",
+                               "7" = "B cells",
+                               "8" = "NK cells",
+                               "9" = "CD8+ T cells",
+                               "10" = "FCGR3A+ monocytes",
+                               "11" = "B cells",
+                               "12" = "NK cells",
+                               "13" = "B cells",
+                               "14" = "Conventional dendritic cells",
+                               "15" = "Megakaryocytes",
+			       "16" = "Plasmacytoid dendritic cells")
+
+seurat$celltype <- Idents(seurat)
+Idents(seurat) <- "celltype"
+```
+
+```{r}
+# df <- FindMarkers(seurat, assay="RNA", only.pos=TRUE)
+# write.csv(df, "genes.csv")
+# df <- read.csv("genes.csv")
+
+# cd8 <- df[df$cluster == "CD8+ T cells", ]
+# cd4 <- df[df$cluster == "Naive or memory CD4+ T cells", ]
+# b <- df[df$cluster == "B cells", ]
+```
+
+```{r fig.height=6}
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = celltype,
+            fill=celltype),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle(glue("{name_project}\nCelltypes")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = celltype, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+```{r fig.height=5, fig.width=7}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nCelltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+# Surfaceome genes
+```{r}
+# surfaceome <- read.csv("../data/surfaceome.csv")
+
+# library('biomaRt')
+# mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+# gene_IDs <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"),
+#               values = surfaceome$ENSEMBL.Gene.ID, mart= mart)
+
+# surfaceome_genes <- left_join(x = surfaceome, y = gene_IDs, by = c("ENSEMBL.Gene.ID" = "ensembl_gene_id"))
+# surfaceome_genes <- surfaceome_genes$hgnc_symbol
+
+# surfaceome_genes <- rownames(seurat$RNA)[rownames(seurat$RNA) %in% surfaceome_genes]
+
+# write.csv(surfaceome_genes, "../data/surfaceome_genes.csv")
+
+surfaceome_genes <- read.csv("../data/surfaceome_genes.csv")$x
+as.data.frame(surfaceome_genes)
+```
+
+## Select markers
+
+We are going to use a handful of known CD8 (positive controls) and a variety of other celltype (negative controls) markers to see how well each method works. Here we can see the expression distribution based upon the RNA normalized expression (not SCTranformed yet).
+
+```{r fig.width=15}
+markers <- list()
+
+markers[["CD8"]] <- c("CCL5", "CST7", "GZMB", "CD8A", "PRF1", "CD3D")
+# markers[["CD4"]] <- c("CD4", "LEF1", "CD3E", "CD3G", "IL7R")
+markers[["B"]] <- c("CD79A", "MS4A1", "IGHM")
+markers[["Monocytes"]] <- c("CD14", "LYZ", "FCGR3A", "MS4A7")
+
+
+genes <- unname(unlist(markers))
+surfaceome_genes <- unique(c(surfaceome_genes, genes))
+
+# Manually remove B2M because it is an outlier that skews the data
+surfaceome_genes <- surfaceome_genes[surfaceome_genes != "B2M"]
+
+DotPlot(seurat, markers)
+```
+
+```{r}
+genes_label <- c()
+for (marker in names(markers)) {
+  g <- markers[[marker]]
+  names(g) <- rep(marker, length(g))
+
+  genes_label <- c(genes_label, g)
+}
+genes_label <- data.frame(gene=genes_label, celltype=names(genes_label)) %>% column_to_rownames(var="gene")
+```
+
+# Subset to CD8 T cells
+
+Since this is just going to be an example of the workflow and things that we have accomplished, I am going to subset the dataset to just the CD8 T cells to simplify this exercise. During this, step I am re-running SCTransform on the subsetted data. 
+
+```{r}
+seurat <- subset(seurat, subset = (celltype == "CD8+ T cells"))
+
+# Removing genes that have 0 counts across all cells of the celltype
+counts <- seurat[["RNA"]]@counts
+genes.use <- rowSums(counts) > 0
+genes.use <- names(genes.use[genes.use])
+seurat <- seurat[genes.use, ]
+rm(counts)
+
+# Get the updated list of surfaceome genes for these cells
+surfaceome_genes <- surfaceome_genes[surfaceome_genes %in% row.names(seurat[["RNA"]])]
+genes <- genes[genes %in% surfaceome_genes]
+
+# Re-run SCT with hvgs set as surfaceome genes to make sure that they get normalized
+VariableFeatures(seurat) <- surfaceome_genes
+seurat <- SCTransform(seurat, return.only.var.genes=TRUE, variable.features.n=length(surfaceome_genes))
+```
+
+Additionally, I am going to select the top 100 genes (within the surfaceome gene list) based upon average expression and number of cells it is expressed in. Similarly, I am taking the bottom 50. So in total, we will be running this pipeline on 150 genes + selected marker genes (which are labelled in red). I am subsetting the genes for the sake of saving time for this report as we define best practices.
+
+```{r fig.height=5, fig.width=8}
+data_sct <- FetchData(seurat[["SCT"]], vars=surfaceome_genes)
+
+num_cells <- colSums(data_sct > 0)
+avg_expression <- colMeans(data_sct)
+
+df_genes <- data.frame(num_cells=num_cells, avg_expression=avg_expression)
+df_genes$gene <- row.names(df_genes)
+
+set.seed(2024)
+df_genes <- df_genes[with(df_genes, order(avg_expression, num_cells)), ]
+surfaceome_genes <- c(sample_n(df_genes, 100)$gene, tail(df_genes, 50)$gene)
+surfaceome_genes <- unique(c(surfaceome_genes, genes))
+
+ggplot(df_genes, aes(x=num_cells, y=avg_expression)) +
+  geom_point() +
+  theme_classic() +
+  geom_text(aes(label=ifelse(gene %in% genes, as.character(gene), '')), hjust=-0.1, vjust=0.1, color="red")
+```
+
+Here we can see the distribution of the celltype marker genes we identified before.
+
+```{r}
+df_genes[df_genes$gene %in% genes, ]
+```
+
+# Normalization/Imputation
+
+We compare three alternative methods of estimating expression levels to log normalization and assess their ability to account for dropout.
+
+1. SCTransform (raw counts -> normalized counts)
+2. MAGIC (raw counts -> imputed, normalized counts)
+3. SAVER (raw counts -> imputed, normalized counts)
+
+Here I am first showing the heatmap of expression for each cell after imputation/normalization for the marker genes so we can have some sense of how imputation changes the expression. I additionally show the average expression for each gene across all cells in the last section.
+
+```{r}
+# Get raw counts
+raw_rna <- FetchData(seurat[["RNA"]], vars=surfaceome_genes, layer="counts")
+```
+
+## Log normalization
+```{r}
+data_rna <- FetchData(seurat[["RNA"]], vars=surfaceome_genes, layer="data")
+
+pheatmap(data_rna[genes], annotation_col = genes_label, cluster_rows = T, cluster_cols = TRUE, show_rownames = FALSE)
+```
+
+## SCTransform
+
+```{r}
+data_sct <- FetchData(seurat[["SCT"]], vars=surfaceome_genes, layer="data")
+
+pheatmap(data_sct[genes], annotation_col = genes_label, cluster_rows = T, cluster_cols = TRUE, show_rownames = FALSE)
+```
+
+## MAGIC
+
+```{r}
+# MAGIC
+# Load conda environment
+myenvs <- reticulate::conda_list()
+envname <- myenvs$name[3]
+reticulate::use_condaenv(envname, required = TRUE)
+
+library(Rmagic)
+
+data_magic <- magic(raw_rna)$result
+
+pheatmap(data_magic[genes], annotation_col = genes_label, cluster_rows = T, cluster_cols = TRUE, show_rownames = FALSE)
+```
+
+## SAVER
+
+```{r}
+# Generate SAVER predictions for those genes
+data_saver <- saver(t(raw_rna), estimates.only = TRUE, ncores=8)
+data_saver <- data.frame(t(data_saver))
+
+pheatmap(data_saver[genes], annotation_col = genes_label,  cluster_rows = T, cluster_cols = TRUE, show_rownames = FALSE)
+```
+
+## Average expression after normalization/imputation
+
+An important note is that the scale for SAVER and MAGIC is very different (the values tend to be higher) which means we cannot expect a 1:1 comparison of values. 
+
+```{r}
+df_avg_impute <- data.frame(rna=colMeans(data_rna), sct=colMeans(data_sct), magic=colMeans(data_magic), saver=colMeans(data_saver))
+# pheatmap(df_avg_impute, cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = TRUE, display_numbers = round(df_avg_impute,2))
+pheatmap(df_avg_impute,  cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = FALSE, scale="row")
+
+# df_avg_impute
+```
+
+Subsetting the above heatmap to just the marker genes.
+
+```{r}
+df <- df_avg_impute[genes, ]
+pheatmap(df, annotation_row = genes_label,  cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = TRUE, display_numbers = round(df,2))
+```
+
+Here I am comparing the average expression for each method (SCT, MAGIC, SAVER) against the log-normalized RNA expression.
+
+```{r fig.width=18, fig.height=5}
+df_avg_impute$gene <- rownames(df_avg_impute)
+
+plot_list <- list()
+idx <- 1
+
+# SCT
+p <- ggplot(df_avg_impute, aes(x=rna, y=sct)) +
+        geom_point() +
+        theme_classic() +
+        ggtitle("SCT") +
+        geom_text(aes(label=ifelse(gene %in% genes, as.character(gene), '')), 
+                        hjust=-0.1, vjust=0.1, color="red") 
+plot_list[[idx]] <- p
+idx <- idx + 1
+
+# MAGIC
+p <- ggplot(df_avg_impute, aes(x=rna, y=magic)) +
+        geom_point() +
+        theme_classic() +
+        ggtitle("MAGIC") +
+        geom_text(aes(label=ifelse(gene %in% genes, as.character(gene), '')), 
+                        hjust=-0.1, vjust=0.1, color="red")
+plot_list[[idx]] <- p
+idx <- idx + 1
+
+# SAVER
+p <- ggplot(df_avg_impute, aes(x=rna, y=saver)) +
+        geom_point() +
+        theme_classic() +
+        ggtitle("SAVER") +
+        geom_text(aes(label=ifelse(gene %in% genes, as.character(gene), '')), 
+                        hjust=-0.1, vjust=0.1, color="red")
+plot_list[[idx]] <- p
+idx <- idx + 1
+
+cowplot::plot_grid(plotlist = plot_list, ncol=3)
+```
+
+## Conclusions
+
+TODO
+
+# Correlation/Co-expression
+
+We have several different methods that we can use for computing correlation scores with associated p-values:
+
+1. Spearman correlation 
+  - SCTransform counts -> spearman correlation matrix
+  - MAGIC imputed -> spearman correlation matrix
+  - SAVER imputed -> spearman correlation matrix
+2. CS-CORE (raw counts -> co-expression matrix )
+
+## Log normalization
+```{r}
+data_rna <- FetchData(seurat[["RNA"]], vars=surfaceome_genes)
+pearson_corr <- Hmisc::rcorr(as.matrix(data_rna), type="spearman")
+
+# Diagonal values are set to NA in this package
+# p-value set to 0 for diagonals
+p_corr_rna <- pearson_corr$P
+diag(p_corr_rna) <- 0
+# Correlation set to 1 for diagonals
+corr_rna <- pearson_corr$r
+diag(corr_rna) <- 1
+
+# The remaining NA values are genes that have 0 expression for all cells
+p_corr_rna[is.na(p_corr_rna)] <- 1
+corr_rna[is.na(corr_rna)] <- 0
+
+# pheatmap(corr_rna)
+```
+
+## SCT
+```{r}
+data_sct <- FetchData(seurat[["SCT"]], vars=surfaceome_genes)
+pearson_corr <- Hmisc::rcorr(as.matrix(data_sct), type="spearman")
+
+# Diagonal values are set to NA in this package
+# p-value set to 0 for diagonals
+p_corr_sct <- pearson_corr$P
+diag(p_corr_sct) <- 0
+# Correlation set to 1 for diagonals
+corr_sct <- pearson_corr$r
+diag(corr_sct) <- 1
+
+# The remaining NA values are genes that have 0 expression for all cells
+p_corr_sct[is.na(p_corr_sct)] <- 1
+corr_sct[is.na(corr_sct)] <- 0
+
+# pheatmap(corr_sct)
+```
+
+## MAGIC
+```{r}
+pearson_corr <- Hmisc::rcorr(as.matrix(data_magic), type="spearman")
+
+# Diagonal values are set to NA in this package
+# p-value set to 0 for diagonals
+p_corr_magic <- pearson_corr$P
+diag(p_corr_magic) <- 0
+# Correlation set to 1 for diagonals
+corr_magic <- pearson_corr$r
+diag(corr_magic) <- 1
+
+# The remaining NA values are genes that have 0 expression for all cells
+p_corr_magic[is.na(p_corr_magic)] <- 1
+corr_magic[is.na(corr_magic)] <- 0
+
+# pheatmap(corr_magic)
+```
+
+## SAVER
+```{r}
+pearson_corr <- Hmisc::rcorr(as.matrix(data_saver), type="spearman")
+
+# Diagonal values are set to NA in this package
+# p-value set to 0 for diagonals
+p_corr_saver <- pearson_corr$P
+diag(p_corr_saver) <- 0
+# Correlation set to 1 for diagonals
+corr_saver <- pearson_corr$r
+diag(corr_saver) <- 1
+
+# The remaining NA values are genes that have 0 expression for all cells
+p_corr_saver[is.na(p_corr_saver)] <- 1
+corr_saver[is.na(corr_saver)] <- 0
+
+# pheatmap(corr_saver)
+```
+
+## CS-CORE
+
+```{r}
+CSCORE_result <- CSCORE(seurat, genes = surfaceome_genes)
+
+corr_cscore <- CSCORE_result$est
+p_corr_cscore <- CSCORE_result$p_value
+
+# pheatmap(corr_cscore)
+```
+
+
+# WGCNA modules
+
+Then we can attribute modules to each of the genes. We can supply either the CS-core correlation estimate or the pearson correlation  matrix to see how different the modules appear depending on what we supply to WGCNA. In the process of doing this, I optimized a "soft thresholding" parameter within during the process as each method works best with different parameters.
+
+For each method I am plotting the heatmap of correlation/co-expression estimates with non-significant pairs set to the value 0 (BH adjust matrix) - this was the matrix used as input for WGCNA. I am showing the fully set of 150+ genes first with annotations and later just the marker genes.
+
+```{r}
+run_wgcna <- function(mtx_coex, mtx_pval, genes, power) {
+  # Obtain BH-adjusted p values
+  p_matrix_BH <- matrix(0, length(genes), length(genes))
+  p_matrix_BH[upper.tri(p_matrix_BH)] <- p.adjust(mtx_pval[upper.tri(mtx_pval)], method = "BH")
+  p_matrix_BH <- p_matrix_BH + t(p_matrix_BH)
+
+  # Set co-expression entires with BH-adjusted p-values greater than 0.05 to 0
+  mtx_coex[p_matrix_BH > 0.05] <- 0
+
+  adj <- WGCNA::adjacency.fromSimilarity(abs(mtx_coex), power = power)
+
+
+  # Compute the topological overlap matrix
+  TOM <- WGCNA::TOMsimilarity(adj)
+  dissTOM <- 1 - TOM
+  rownames(dissTOM) <- colnames(dissTOM) <- genes
+  # Run hierarchical clustering as in the WGCNA workflow
+  hclust_dist <- hclust(as.dist(dissTOM), method = "average") 
+  memb <- dynamicTreeCut::cutreeDynamic(dendro = hclust_dist, 
+                      distM = dissTOM, 
+                      deepSplit = 2,
+                      pamRespectsDendro = FALSE,
+                      minClusterSize = 15)
+
+  # For more instructions on how to tune the parameters in the WGCNA workflow,
+  # please refer to https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/
+
+  names(memb) <- genes
+  memb_tab <- table(memb)
+  module_list <- lapply(sort(unique(memb)), function(i_k) names(which(memb == i_k)))
+
+  module_df <- data.frame(memb)
+  module_df$memb <- as.character(module_df$memb)
+  df <- module_df
+  df <- tibble::rownames_to_column(df, "gene")
+  colnames(df) <- c("gene", "module")
+
+  results <- list()
+  results[["wgcna"]] <- df
+  results[["bh_mtx"]] <- mtx_coex
+
+  return(results)
+}
+```
+
+## Log normalization
+
+```{r}
+results <- run_wgcna(corr_rna, p_corr_rna, surfaceome_genes, power=2)
+wgcna_rna <- results$wgcna
+mtx_rna <- results$bh_mtx
+
+# wgcna_rna
+```
+
+```{r}
+rownames(wgcna_rna) <- wgcna_rna$gene
+anno <- wgcna_rna[, "module", drop=F]
+
+pheatmap(mtx_rna, annotation_row=anno, annotation_col=anno, show_rownames = F, show_colnames = F)
+```
+
+```{r}
+mtx <- mtx_rna[genes, genes]
+
+anno <- wgcna_rna[genes, "module", drop=F]
+anno <- merge(anno, genes_label, by=0) %>% column_to_rownames(var="Row.names")
+
+pheatmap(mtx, annotation_row=anno, annotation_col=anno)
+```
+
+
+## SCT
+
+```{r}
+results <- run_wgcna(corr_sct, p_corr_sct, surfaceome_genes, power=2)
+wgcna_sct <- results$wgcna
+mtx_sct <- results$bh_mtx
+
+# wgcna_sct
+```
+
+```{r}
+rownames(wgcna_sct) <- wgcna_sct$gene
+anno <- wgcna_sct[, "module", drop=F]
+
+pheatmap(mtx_sct, annotation_row=anno, annotation_col=anno, show_rownames = F, show_colnames = F)
+```
+
+```{r}
+mtx <- mtx_sct[genes, genes]
+
+anno <- wgcna_sct[genes, "module", drop=F]
+anno <- merge(anno, genes_label, by=0) %>% column_to_rownames(var="Row.names")
+
+pheatmap(mtx, annotation_row=anno, annotation_col=anno)
+```
+
+## MAGIC
+
+```{r}
+results <- run_wgcna(corr_magic, p_corr_magic, surfaceome_genes, power=12)
+wgcna_magic <- results$wgcna
+mtx_magic <- results$bh_mtx
+
+# wgcna_magic
+```
+
+```{r}
+rownames(wgcna_magic) <- wgcna_magic$gene
+anno <- wgcna_magic[, "module", drop=F]
+pheatmap(mtx_magic, annotation_row=anno, annotation_col=anno, show_rownames = F, show_colnames = F)
+```
+
+```{r}
+mtx <- mtx_magic[genes, genes]
+
+anno <- wgcna_magic[genes, "module", drop=F]
+anno <- merge(anno, genes_label, by=0) %>% column_to_rownames(var="Row.names")
+
+pheatmap(mtx, annotation_row=anno, annotation_col=anno)
+```
+
+## SAVER
+
+```{r}
+results <- run_wgcna(corr_saver, p_corr_saver, surfaceome_genes, power=6)
+wgcna_saver <- results$wgcna
+mtx_saver <- results$bh_mtx
+
+# wgcna_saver
+```
+
+```{r}
+rownames(wgcna_saver) <- wgcna_saver$gene
+anno <- wgcna_saver[, "module", drop=F]
+
+rownames(mtx_saver) <- str_replace(rownames(mtx_saver), "\\.", "-")
+colnames(mtx_saver) <- str_replace(colnames(mtx_saver), "\\.", "-")
+
+pheatmap(mtx_saver, annotation_row=anno, annotation_col=anno, show_rownames = F, show_colnames = F)
+```
+
+```{r}
+mtx <- mtx_saver[genes, genes]
+
+anno <- wgcna_saver[genes, "module", drop=F]
+anno <- merge(anno, genes_label, by=0) %>% column_to_rownames(var="Row.names")
+
+pheatmap(mtx, annotation_row=anno, annotation_col=anno)
+```
+
+## CS-CORE
+
+```{r}
+results <- run_wgcna(corr_cscore, p_corr_cscore, surfaceome_genes, power=1)
+wgcna_cscore <- results$wgcna
+mtx_cscore <- results$bh_mtx
+
+rownames(mtx_cscore) <- str_replace(rownames(mtx_cscore), "\\.", "-")
+colnames(mtx_cscore) <- str_replace(colnames(mtx_cscore), "\\.", "-")
+
+wgcna_cscore
+```
+
+```{r}
+rownames(wgcna_cscore) <- wgcna_cscore$gene
+anno <- wgcna_cscore[, "module", drop=F]
+pheatmap(mtx_cscore, annotation_row=anno, annotation_col=anno, show_rownames = F, show_colnames = F)
+```
+
+```{r}
+mtx <- mtx_cscore[genes, genes]
+
+anno <- wgcna_cscore[genes, "module", drop=F]
+anno <- merge(anno, genes_label, by=0) %>% column_to_rownames(var="Row.names")
+
+pheatmap(mtx, annotation_row=anno, annotation_col=anno)
+```
+
+# Checking consensus
+
+```{r}
+n_cells <- data.frame(surfaceome_genes) %>% rename(gene=surfaceome_genes)
+rownames(n_cells) <- n_cells$gene
+
+idx <- 1
+for (df in list(data_rna, data_sct, data_magic, data_saver)) {
+  tmp <- data.frame(colSums(df > 0))
+  colnames(tmp) <- c(idx)
+  tmp$gene <- rownames(tmp)
+  idx <- idx + 1
+
+  n_cells <- merge(n_cells, tmp)
+}
+colnames(n_cells) <- c("gene", "rna_ncells", "sct_ncells", "magic_ncells", "saver_ncells")
+```
+
+## Modules
+```{r}
+comp_modules <- data.frame(surfaceome_genes)
+colnames(comp_modules) <- c("gene")
+rownames(comp_modules) <- comp_modules$gene
+
+comp_modules <- merge(comp_modules, wgcna_sct) %>% rename(sct_module=module)
+comp_modules <- merge(comp_modules, wgcna_magic) %>% rename(magic_module=module)
+comp_modules <- merge(comp_modules, wgcna_saver) %>% rename(saver_module=module)
+comp_modules <- merge(comp_modules, wgcna_cscore) %>% rename(cscore_module=module)
+
+comp_modules <- merge(comp_modules, df_avg_impute) %>% rename(sct_avg=sct, magic_avg=magic, saver_avg=saver, rna_avg=rna)
+comp_modules <- merge(comp_modules, n_cells)
+comp_modules
+```
+
+## Co-expression values
+
+```{r}
+comp_corr <- reshape2::melt(mtx_sct) %>% rename(sct=value)
+
+tmp <- reshape2::melt(mtx_magic) %>% rename(magic=value)
+comp_corr <- merge(comp_corr, tmp)
+
+tmp <- reshape2::melt(mtx_saver) %>% rename(saver=value)
+comp_corr <- merge(comp_corr, tmp)
+
+tmp <- reshape2::melt(mtx_cscore) %>% rename(cscore=value)
+comp_corr <- merge(comp_corr, tmp)
+
+# Remove pairs of itself
+comp_corr <- comp_corr[(comp_corr$Var1 != comp_corr$Var2), ]
+
+# Remove duplicates
+idx <- t(apply(comp_corr[, c("Var1", "Var2")], 1, sort))
+comp_corr <- cbind(idx, comp_corr[c("sct", "magic", "saver", "cscore")])
+comp_corr <- unique(comp_corr)
+
+colnames(comp_corr) <- c("Var1", "Var2", "sct", "magic", "saver", "cscore")
+
+head(comp_corr)
+```
+
+# Determining new pairs
+
+## SCT
+
+```{r}
+df <- comp_corr[(comp_corr$sct != 0) & (comp_corr$sct != 1), ]
+
+# Get modules for each gene in the pair
+tmp <- comp_modules$sct_module
+names(tmp) <- comp_modules$gene
+
+df$Var1_module <- tmp[df$Var1]
+df$Var2_module <- tmp[df$Var2]
+
+df$module_pair <- (df$Var1_module == df$Var2_module)
+
+# Get average for each gene in the pair
+tmp <- comp_modules$sct_avg
+names(tmp) <- comp_modules$gene
+
+df$Var1_avg <- tmp[df$Var1]
+df$Var2_avg <- tmp[df$Var2]
+
+# Get ncells each gene is ecpressed in 
+tmp <- comp_modules$sct_ncells
+names(tmp) <- comp_modules$gene
+
+df$Var1_ncells <- tmp[df$Var1]
+df$Var2_ncells <- tmp[df$Var2]
+```
+
+How many pairs are in the same WGCNA module:
+
+```{r}
+print(table(df$module_pair))
+df <- df[df$module_pair == TRUE, ]
+```
+
+What is the average expression of each gene and how many cells are they expressed in? Further subsetting pairs by genes that are expressed in at least 100 cells (for both genes).
+
+```{r}
+df <- df %>% arrange(desc(sct))
+df <- df[(df$Var1_ncells > 100) & (df$Var2_ncells > 100), ]
+
+head(df)
+```
+
+Comparing the expression of the top pair
+
+```{r}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+ggplot(data_sct, aes(x=get(gene_1), y=get(gene_2))) +
+    geom_point() +
+    theme_classic() +
+    xlab(gene_1) + ylab(gene_2)
+```
+
+
+## MAGIC
+
+```{r}
+df <- comp_corr[(comp_corr$magic != 0) & (comp_corr$magic != 1), ]
+
+# Get modules for each gene in the pair
+tmp <- comp_modules$magic_module
+names(tmp) <- comp_modules$gene
+
+df$Var1_module <- tmp[df$Var1]
+df$Var2_module <- tmp[df$Var2]
+
+df$module_pair <- (df$Var1_module == df$Var2_module)
+
+# Get average for each gene in the pair
+tmp <- comp_modules$magic_avg
+names(tmp) <- comp_modules$gene
+
+df$Var1_avg <- tmp[df$Var1]
+df$Var2_avg <- tmp[df$Var2]
+
+# Get ncells each gene is ecpressed in 
+tmp <- comp_modules$magic_ncells
+names(tmp) <- comp_modules$gene
+
+df$Var1_ncells <- tmp[df$Var1]
+df$Var2_ncells <- tmp[df$Var2]
+```
+
+How many pairs are in the same WGCNA module:
+
+```{r}
+print(table(df$module_pair))
+df <- df[df$module_pair == TRUE, ]
+```
+
+What is the average expression of each gene and how many cells are they expressed in? Further subsetting pairs by genes that are expressed in at least 100 cells (for both genes).
+
+```{r}
+df <- df %>% arrange(desc(magic))
+df <- df[(df$Var1_ncells > 100) & (df$Var2_ncells > 100), ]
+
+head(df)
+```
+
+Comparing the expression of the top pair
+
+```{r}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+ggplot(data_magic, aes(x=get(gene_1), y=get(gene_2))) +
+    geom_point() +
+    theme_classic() +
+    xlab(gene_1) + ylab(gene_2) 
+```
+
+## SAVER
+
+```{r}
+df <- comp_corr[(comp_corr$saver != 0) & (comp_corr$saver != 1), ]
+
+# Get modules for each gene in the pair
+tmp <- comp_modules$saver_module
+names(tmp) <- comp_modules$gene
+
+df$Var1_module <- tmp[df$Var1]
+df$Var2_module <- tmp[df$Var2]
+
+df$module_pair <- (df$Var1_module == df$Var2_module)
+
+# Get average for each gene in the pair
+tmp <- comp_modules$saver_avg
+names(tmp) <- comp_modules$gene
+
+df$Var1_avg <- tmp[df$Var1]
+df$Var2_avg <- tmp[df$Var2]
+
+# Get ncells each gene is ecpressed in 
+tmp <- comp_modules$saver_ncells
+names(tmp) <- comp_modules$gene
+
+df$Var1_ncells <- tmp[df$Var1]
+df$Var2_ncells <- tmp[df$Var2]
+```
+
+How many pairs are in the same WGCNA module:
+
+```{r}
+print(table(df$module_pair))
+df <- df[df$module_pair == TRUE, ]
+```
+
+What is the average expression of each gene and how many cells are they expressed in? Further subsetting pairs by genes that are expressed in at least 100 cells (for both genes).
+
+```{r}
+df <- df %>% arrange(desc(saver))
+df <- df[(df$Var1_ncells > 100) & (df$Var2_ncells > 100), ]
+
+head(df)
+```
+
+Comparing the expression of the top pair
+
+```{r}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+ggplot(data_saver, aes(x=get(gene_1), y=get(gene_2))) +
+    geom_point() +
+    theme_classic() +
+    xlab(gene_1) + ylab(gene_2)
+```
+
+Maybe we should also be filtering on a minimum average expression? Filtering to be > 0.5
+
+```{r}
+df <- df[(df$Var1_avg > 0.5) & (df$Var2_avg > 0.5), ]
+
+head(df)
+```
+
+
+```{r}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+ggplot(data_saver, aes(x=get(gene_1), y=get(gene_2))) +
+    geom_point() +
+    theme_classic() +
+    xlab(gene_1) + ylab(gene_2)
+```
+
+
+## CS-CORE
+
+```{r}
+df <- comp_corr[(comp_corr$cscore != 0) & (comp_corr$cscore != 1), ]
+
+# Get modules for each gene in the pair
+tmp <- comp_modules$cscore_module
+names(tmp) <- comp_modules$gene
+
+df$Var1_module <- tmp[df$Var1]
+df$Var2_module <- tmp[df$Var2]
+
+df$module_pair <- (df$Var1_module == df$Var2_module)
+
+# Get average for each gene in the pair
+tmp <- comp_modules$sct_avg
+names(tmp) <- comp_modules$gene
+
+df$Var1_avg <- tmp[df$Var1]
+df$Var2_avg <- tmp[df$Var2]
+
+# Get ncells each gene is ecpressed in 
+tmp <- comp_modules$sct_ncells
+names(tmp) <- comp_modules$gene
+
+df$Var1_ncells <- tmp[df$Var1]
+df$Var2_ncells <- tmp[df$Var2]
+```
+
+How many pairs are in the same WGCNA module:
+
+```{r}
+print(table(df$module_pair))
+df <- df[df$module_pair == TRUE, ]
+```
+
+What is the average expression of each gene and how many cells are they expressed in? Further subsetting pairs by genes that are expressed in at least 100 cells (for both genes).
+
+```{r}
+df <- df %>% arrange(desc(cscore))
+df <- df[(df$Var1_ncells > 100) & (df$Var2_ncells > 100), ]
+
+head(df)
+```
+
+Comparing the expression of the top pair (using SCT expression)
+
+```{r}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+ggplot(data_sct, aes(x=get(gene_1), y=get(gene_2))) +
+    geom_point() +
+    theme_classic() +
+    xlab(gene_1) + ylab(gene_2)
+```
+
+Maybe we should also be filtering on a minimum average expression? Filtering to be > 0.5
+
+```{r}
+df <- df[(df$Var1_avg > 0.5) & (df$Var2_avg > 0.5), ]
+
+head(df)
+```
+
+
+```{r}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+ggplot(data_saver, aes(x=get(gene_1), y=get(gene_2))) +
+    geom_point() +
+    theme_classic() +
+    xlab(gene_1) + ylab(gene_2)
+```
+
+# Positive and negative controls
+
+```{r}
+```
+
+# Next steps
+
+Todo tomorrow:
+
+1. Looking at values for positive and negative controls (will do tomorrow morning)
+2. Add more conclusions about comparing the different results (will do tomorrow morning)
+3. Flushing out next steps
+
+Actual next steps:
+
+1. More QC metrics
+2. Run on protein dataset - compare against protein expression

@@ -1,0 +1,302 @@
+---
+title: "Merck - MAGIC PBMC 3k"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r}
+#' Create sub-chunks for plots
+#' Plotting function to generate plots of a specific dimension when html is knitted
+#'
+#' taken from: https://stackoverflow.com/questions/15365829/dynamic-height-and-width-for-knitr-plots
+#'
+#' @param pl a plot object
+#' @param fig.height figure height
+#' @param fig.width figure width
+#' @param chunk_name name of the chunk
+#'
+#' @author Andreas Scharmueller \email{andschar@@protonmail.com}
+#'
+subchunkify = function(pl,
+                       fig.height = 7,
+                       fig.width = 5,
+                       chunk_name = 'plot') {
+  pl_deparsed = paste0(deparse(function() {
+    pl
+  }), collapse = '')
+  
+  sub_chunk = paste0(
+    "```{r ",
+    chunk_name,
+    ", fig.height=",
+    fig.height,
+    ", fig.width=",
+    fig.width,
+    ", dpi=72",
+    ", echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}",
+    "\n(",
+    pl_deparsed,
+    ")()",
+    "\n```"
+  )
+  
+  cat(knitr::knit(
+    text = knitr::knit_expand(text = sub_chunk),
+    quiet = TRUE
+  ))
+}
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+
+I have pulled the dataset from the single-cell RNA-seq tutorial that we host at the core. More information about this dataset and how it processed can be found in the tutorial we have available on our website:
+
+https://hbctraining.github.io/scRNA-seq_online/schedule/
+
+The basic processing information for this sample includes:
+
+- The libraries were prepared using 10X Genomics version 2 chemistry
+- The samples were sequenced on the Illumina NextSeq 500
+- PBMC samples from eight individual lupus patients were separated into two aliquots each.
+- One aliquot of PBMCs was activated by 100 U/mL of recombinant IFN-β for 6 hours.
+- The second aliquot was left untreated.
+- After 6 hours, the eight samples for each condition were pooled together in two final pools (stimulated cells and control cells). We will be working with these two, pooled samples. 
+- 12,138 and 12,167 cells were identified (after removing doublets) for control and stimulated pooled samples, respectively.
+
+A brief overview of what the dataset looks like:
+
+```{r}
+# Name of column we are doing comparisons for
+fill <- "sample"
+
+n_samples <- 2
+nrows <- 1
+ncols <- 2
+```
+
+```{r}
+# Load dataset
+load(bzfile("../data/seurat_integrated.RData.bz2"))
+seurat <- seurat_integrated
+```
+
+## UMAP {.tabset}
+
+### Sample
+```{r fig.width=6, fig.height=5}
+Idents(seurat) <- "sample"
+
+DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nSample")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+```
+
+
+### Celltype
+```{r fig.width=7, fig.height=5}
+# Rename all identities
+Idents(object = seurat) <- "integrated_snn_res.0.8"
+seurat <- RenameIdents(object = seurat, 
+                               "0" = "Naive or memory CD4+ T cells",
+                               "1" = "CD14+ monocytes",
+                               "2" = "Activated T cells",
+                               "3" = "CD14+ monocytes",
+                               "4" = "Stressed cells / Unknown",
+                               "5" = "CD8+ T cells",
+                               "6" = "Naive or memory CD4+ T cells",
+                               "7" = "B cells",
+                               "8" = "NK cells",
+                               "9" = "CD8+ T cells",
+                               "10" = "FCGR3A+ monocytes",
+                               "11" = "B cells",
+                               "12" = "NK cells",
+                               "13" = "B cells",
+                               "14" = "Conventional dendritic cells",
+                               "15" = "Megakaryocytes",
+			       "16" = "Plasmacytoid dendritic cells")
+seurat$celltype <- Idents(seurat)
+
+celltypes <- levels(seurat$celltype)
+celltypes <- celltypes[celltypes != "Stressed cells / Unknown"]
+```
+
+```{r}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nSeurat Clusters")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+# MAGIC
+```{r}
+# git clone git://github.com/KrishnaswamyLab/MAGIC.git
+# cd MAGIC/python
+# python setup.py install --user
+# cd ../Rmagic
+# R CMD INSTALL .
+
+### Please see the 03_magic.R script
+```
+
+
+# Imputation with MAGIC by celltypes
+
+```{r results="asis", echo=FALSE}
+for (ct in celltypes) {
+
+  cat(paste0("## ", ct, "\n\n"))
+  seurat_sub <- subset(seurat, subset=(celltype == ct))
+
+  coex_df <- read.csv(glue("02.1-cs_core/{ct}.csv")) %>% arrange(p_value)
+  # Gene name of top co-expressed genes
+  gene_1 <- as.character(coex_df[1, "Var1"])
+  gene_2 <- as.character(coex_df[1, "Var2"])
+
+  cat("### Before imputation\n")
+  # Counts for genes
+  counts <- data.frame(t(data.frame(seurat_sub$RNA@data[c(gene_1, gene_2), ])))
+  colnames(counts) <- c(gene_1, gene_2)
+
+  # Scatterplot
+  scatter <- ggplot(counts) +
+      geom_point(aes(x=get(gene_1), y=get(gene_2))) +
+      scale_fill_continuous(type = "viridis") +
+      theme_classic() +
+      xlab(gene_1) +
+      ylab(gene_2) +
+      geom_abline(slope=1, intercept = 0, color="red")
+
+  n_zero <- dim(counts)[1]
+  # Remove cells with 0 expression for both genes
+  counts_zero <- counts[rowSums(counts) > 0, ]
+  n_zero <- n_zero - dim(counts_zero)[1]
+
+  cat(glue("As the scatterplot can make it difficult to see how many cells overlap at the same values, I have taken the same information displayed as a density plot. To create a better scale, I removed cells that have 0 expression for both genes ({n_zero} cells).\n\n"))
+
+  # Density scatterplot
+  density <- ggplot(counts_zero) +
+      geom_bin2d(aes(x=get(gene_1), y=get(gene_2)), bins=70) +
+      scale_fill_continuous(type = "viridis") +
+      theme_classic() +
+      xlab(gene_1) +
+      ylab(gene_2) +
+      geom_abline(slope=1, intercept = 0, color="red")
+
+  p <- cowplot::plot_grid(scatter, density, ncol=2)
+  subchunkify(p, 6, 13, glue("{ct}-scatter"))
+  cat("\n\n")
+
+
+  cat("### After magic imputation\n")
+  # Counts for genes
+  counts <- read.csv(glue("03_magic/{ct}.csv"))
+  gene_1 <- str_replace(gene_1, "-", ".")
+  gene_2 <- str_replace(gene_2, "-", ".")
+  counts <- counts[c(gene_1, gene_2)]
+
+  colnames(counts) <- c(gene_1, gene_2)
+
+  # Scatterplot
+  scatter <- ggplot(counts) +
+      geom_point(aes(x=get(gene_1), y=get(gene_2))) +
+      scale_fill_continuous(type = "viridis") +
+      theme_classic() +
+      xlab(gene_1) +
+      ylab(gene_2) +
+      geom_abline(slope=1, intercept = 0, color="red")
+
+  n_zero <- dim(counts)[1]
+  # Remove cells with 0 expression for both genes
+  counts_zero <- counts[rowSums(counts) > 0, ]
+  n_zero <- n_zero - dim(counts_zero)[1]
+
+  cat(glue("As the scatterplot can make it difficult to see how many cells overlap at the same values, I have taken the same information displayed as a density plot. To create a better scale, I removed cells that have 0 expression for both genes ({n_zero} cells).\n\n"))
+
+  # Density scatterplot
+  density <- ggplot(counts_zero) +
+      geom_bin2d(aes(x=get(gene_1), y=get(gene_2)), bins=70) +
+      scale_fill_continuous(type = "viridis") +
+      theme_classic() +
+      xlab(gene_1) +
+      ylab(gene_2) +
+      geom_abline(slope=1, intercept = 0, color="red")
+
+  p <- cowplot::plot_grid(scatter, density, ncol=2)
+  subchunkify(p, 6, 13, glue("{ct}-scatter_imputed"))
+  cat("\n\n")
+}
+```

@@ -1,0 +1,604 @@
+---
+title: "Merck - SAVER PBMC 3k"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r}
+#' Create sub-chunks for plots
+#' Plotting function to generate plots of a specific dimension when html is knitted
+#'
+#' taken from: https://stackoverflow.com/questions/15365829/dynamic-height-and-width-for-knitr-plots
+#'
+#' @param pl a plot object
+#' @param fig.height figure height
+#' @param fig.width figure width
+#' @param chunk_name name of the chunk
+#'
+#' @author Andreas Scharmueller \email{andschar@@protonmail.com}
+#'
+subchunkify = function(pl,
+                       fig.height = 7,
+                       fig.width = 5,
+                       chunk_name = 'plot') {
+  pl_deparsed = paste0(deparse(function() {
+    pl
+  }), collapse = '')
+  
+  sub_chunk = paste0(
+    "```{r ",
+    chunk_name,
+    ", fig.height=",
+    fig.height,
+    ", fig.width=",
+    fig.width,
+    ", dpi=72",
+    ", echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}",
+    "\n(",
+    pl_deparsed,
+    ")()",
+    "\n```"
+  )
+  
+  cat(knitr::knit(
+    text = knitr::knit_expand(text = sub_chunk),
+    quiet = TRUE
+  ))
+}
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+
+library(devtools)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+
+I have pulled the dataset from the single-cell RNA-seq tutorial that we host at the core. More information about this dataset and how it processed can be found in the tutorial we have available on our website:
+
+https://hbctraining.github.io/scRNA-seq_online/schedule/
+
+The basic processing information for this sample includes:
+
+- The libraries were prepared using 10X Genomics version 2 chemistry
+- The samples were sequenced on the Illumina NextSeq 500
+- PBMC samples from eight individual lupus patients were separated into two aliquots each.
+- One aliquot of PBMCs was activated by 100 U/mL of recombinant IFN-β for 6 hours.
+- The second aliquot was left untreated.
+- After 6 hours, the eight samples for each condition were pooled together in two final pools (stimulated cells and control cells). We will be working with these two, pooled samples. 
+- 12,138 and 12,167 cells were identified (after removing doublets) for control and stimulated pooled samples, respectively.
+
+A brief overview of what the dataset looks like:
+
+```{r}
+# Name of column we are doing comparisons for
+fill <- "sample"
+
+n_samples <- 2
+nrows <- 1
+ncols <- 2
+```
+
+```{r}
+# Load dataset
+load(bzfile("../data/seurat_integrated.RData.bz2"))
+seurat <- seurat_integrated
+```
+
+## UMAP {.tabset}
+
+### Sample
+```{r fig.width=6, fig.height=5}
+Idents(seurat) <- "sample"
+
+DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nSample")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+```
+
+
+### Celltype
+```{r fig.width=7, fig.height=5}
+# Rename all identities
+Idents(object = seurat) <- "integrated_snn_res.0.8"
+
+seurat <- RenameIdents(object = seurat, 
+                               "0" = "Naive or memory CD4+ T cells",
+                               "1" = "CD14+ monocytes",
+                               "2" = "Activated T cells",
+                               "3" = "CD14+ monocytes",
+                               "4" = "Stressed cells / Unknown",
+                               "5" = "CD8+ T cells",
+                               "6" = "Naive or memory CD4+ T cells",
+                               "7" = "B cells",
+                               "8" = "NK cells",
+                               "9" = "CD8+ T cells",
+                               "10" = "FCGR3A+ monocytes",
+                               "11" = "B cells",
+                               "12" = "NK cells",
+                               "13" = "B cells",
+                               "14" = "Conventional dendritic cells",
+                               "15" = "Megakaryocytes",
+			       "16" = "Plasmacytoid dendritic cells")
+seurat$celltype <- Idents(seurat)
+
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nSeurat Clusters")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+## Cell distribution {.tabset}
+
+### Sample
+```{r}
+Idents(seurat) <- "sample"
+seurat@meta.data %>% 
+    ggplot() +
+    geom_bar(aes(
+        x = Idents(seurat),
+        fill = Idents(seurat)), stat = "count", color = "black", show.legend = FALSE) +
+    theme_classic() +
+    xlab("Celltype") +
+    ylab("Number of Cells") +
+    ggtitle(glue("{name_project}\nManual celltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    geom_text(aes(x = Idents(seurat), label = after_stat(count)), stat = "count", vjust = -0.5) +
+    theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+### Celltype
+```{r fig.height=8}
+Idents(seurat) <- "celltype"
+seurat@meta.data %>% 
+    ggplot() +
+    geom_bar(aes(
+        x = Idents(seurat),
+        fill = Idents(seurat)), stat = "count", color = "black", show.legend = FALSE) +
+    theme_classic() +
+    xlab("Celltype") +
+    ylab("Number of Cells") +
+    ggtitle(glue("{name_project}\nManual celltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    geom_text(aes(x = Idents(seurat), label = after_stat(count)), stat = "count", vjust = -0.5) +
+    theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+
+# Surfaceome genes available
+
+I have downloaded the list of genes from the surfaceome for use. I additionally took the ensembl IDs and converted them into potential alternative HGNC symbols to ensure that we are able to capture as many genes in the surfaceome as possible within the dataset. Ultimately there are 1,616 genes for us to work with in this dataset. I ran SAVER on only these surfaceome genes, so all further analyses are done with this set of ~1,600 genes. 
+
+```{r}
+surfaceome <- read.csv("../data/surfaceome.csv")
+
+library('biomaRt')
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+gene_IDs <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"),
+              values = surfaceome$ENSEMBL.Gene.ID, mart= mart)
+
+surfaceome_gene <- left_join(x = surfaceome, y = gene_IDs, by = c("ENSEMBL.Gene.ID" = "ensembl_gene_id"))
+genes <- surfaceome_gene$hgnc_symbol
+
+genes <- rownames(seurat$RNA)[rownames(seurat$RNA) %in% genes]
+as.data.frame(genes)
+```
+
+# Running SAVER
+
+When running imputation, it's best to split the datset by sample/batch and then imputing. To save time and resources will run SAVER imputation on some select genes of interest instead of the entire matrix as that is very time consuming and computationally expensive.
+
+The creator of the tool summarizes the process of running SAVER to be like so: "The SAVER estimates represent the library size normalized posterior means of the recovered gene expression. They can be used as input to many of the common downstream analysis methods such as Seurat and Monocle." I followed the steps outlined in the tutorial on the creator's github page:
+https://mohuangx.github.io/SAVER/articles/saver-tutorial.html
+
+```{r}
+# # devtools::install_github("mohuangx/SAVER")
+# library(SAVER)
+
+# samples <- unique(seurat$sample)
+# saver_results <- list()
+
+# for (sample_ in samples) {
+#     print(sample_)
+#     seurat_sub <- subset(seurat, subset = sample == sample_)
+
+#     # Un-normalized matrix
+#     data <- seurat_sub$RNA@counts
+#     genes.ind <- which(rownames(data) %in% genes)
+
+#     # Generate predictions for those genes
+#     saver.genes <- saver(data, pred.genes = genes.ind, estimates.only = TRUE, ncores=6, pred.genes.only = TRUE)
+#     saver.genes <- t(saver.genes)
+
+#     saver_results[[sample_]] <- t(saver.genes)
+#     print("/n/n")
+# }
+
+# # Merging together the SAVER results from each sample together
+# saver <- c(saver_results[samples[1]], saver_results[samples[2]])
+# saver <- t(data.frame(saver))
+# row.names(saver) <- gsub("ctrl\\.", "", row.names(saver))
+# row.names(saver) <- gsub("stim\\.", "", row.names(saver))
+
+# # Store matrix for easier access
+# write.csv(saver, "saver.csv")
+
+saver <- read.csv("saver.csv")
+row.names(saver) <- saver$X
+saver <- subset(saver, select=-c(X))
+```
+
+## Notes
+
+When working with fewer genes, the results run very quickly locally on a computer - about 2 minutes for 6 genes. For all ~1,600 genes this process took around 30 minutes per sample using 6 cores on my local machine. I have included a sample of what the results look like once the process is completed (after transposing the dataframe for easy viewing):
+
+```{r}
+head(saver)
+```
+
+As you can see, it returns a count matrix that can be stored in a slot within a seurat object for further downstream analyses as described here:
+https://github.com/mohuangx/SAVER/issues/18
+
+# Pearson corelation coefficient
+
+```{r}
+# # Grab the normalized expression for the orignal RNA experiment
+# norm <- t(data.frame(seurat$RNA@data[rownames(seurat$RNA) %in% genes, ]))
+
+# # Double check the order of cells is the same
+# # table(row.names(norm) == row.names(saver))
+
+# pearson <- list()
+# for (gene in genes) {
+#     # Formatting issue where "-" turns to "."
+#     gene_ <- str_replace(gene, "-", ".")
+
+#     corr <- cor(x=saver[, gene_], y=norm[, gene], method = "pearson")
+#     avg_norm <- mean(saver[, gene_])
+#     avg_saver <- mean(norm[, gene])
+
+#     pearson[[gene]] <- c(corr, avg_norm, avg_saver)
+# }
+
+# pearson <- t(data.frame(pearson))
+# colnames(pearson) <- c("pearson_corr", "avg_norm", "avg_saver")
+
+# write.csv(pearson, "pearson.csv")
+
+pearson <- read.csv("pearson.csv")
+```
+
+I have computed the pearson correlation between the saver imputed values and the seurat normalized expression to see how similar the gene expression is between the two. 
+
+## Visualizing the genes
+
+Additionally, I calculated the average expression of these genes in each respective method to help determine which genes would be the most informative to start looking at. To visualize the entire set of genes, I have plotted the average expression in each method against the pearson correlation. Additionally, I have labeled the top 25 genes by average expression in each plot.
+
+```{r fig.width=20, fig.height=10}
+pearson <- pearson %>% arrange(desc(avg_norm))
+pearson$rank <- as.numeric(row.names(pearson))
+p_norm <- ggplot(pearson, aes(x=avg_norm, y=pearson_corr)) +
+    geom_point() +
+    theme_classic() +
+    geom_text(aes(label=ifelse(rank < 25, as.character(X), '')),hjust=0, vjust=-1) +
+    ylab("Pearson correlation coefficient") +
+    xlab("Average seurat normalized expression") +
+    ggtitle("Pearson vs Average normalized expression")
+
+pearson <- pearson %>% arrange(desc(avg_saver))
+pearson$rank <- as.numeric(row.names(pearson))
+p_saver <- ggplot(pearson, aes(x=avg_saver, y=pearson_corr)) +
+    geom_point() +
+    theme_classic() +
+    geom_text(aes(label=ifelse(rank < 25, as.character(X), '')),hjust=0, vjust=-1) +
+    xlab("Average SAVER imputed expression") +
+    ggtitle("Pearson vs Average SAVER expression")
+
+cowplot::plot_grid(plotlist = list(p_norm, p_saver), ncol = 2)
+```
+
+Removing B2M as it is an outlier in the averaged values, making it more difficult to view other genes in the dataset.
+
+```{r fig.width=20, fig.height=10}
+pearson <- pearson[pearson$X != "B2M", ]
+
+pearson <- pearson %>% arrange(desc(avg_norm))
+pearson$rank <- as.numeric(row.names(pearson))
+p_norm <- ggplot(pearson, aes(x=avg_norm, y=pearson_corr)) +
+    geom_point() +
+    theme_classic() +
+    geom_text(aes(label=ifelse(rank < 50, as.character(X), '')),hjust=0, vjust=-1) +
+    ylab("Pearson correlation coefficient") +
+    xlab("Average seurat normalized expression") +
+    ggtitle("Pearson vs Average normalized expression")
+
+pearson <- pearson %>% arrange(desc(avg_saver))
+pearson$rank <- as.numeric(row.names(pearson))
+p_saver <- ggplot(pearson, aes(x=avg_saver, y=pearson_corr)) +
+    geom_point() +
+    theme_classic() +
+    geom_text(aes(label=ifelse(rank < 50, as.character(X), '')),hjust=0, vjust=-1) +
+    xlab("Average SAVER imputed expression") +
+    ggtitle("Pearson vs Average SAVER expression")
+
+cowplot::plot_grid(plotlist = list(p_norm, p_saver), ncol = 2)
+```
+
+# Select genes
+
+I am selecting a few genes to look at in more detail as it would be difficult to visualize all 1,600 genes. I am selecting 15 genes based on their pearson correlation value, selecting the top 5, bottom 5, and middle 5. 
+
+Here I am directly contrasting the expression of individual genes at a per-cell basis to see if there are any factors causing stratification in the datset - including sample (batch) and celltype. I have also included a black y=x line to more clearly see how SAVER compares to standard normalization processes.  
+
+```{r}
+pearson <- read.csv("pearson.csv") %>% arrange(pearson_corr)
+
+top <- tail(pearson, 5)
+bottom <- head(pearson, 5)
+idx_middle <- dim(pearson)[1] / 2
+middle <- pearson[seq(idx_middle-2, idx_middle+2), ]
+
+df <- rbind(top, middle, bottom) %>% arrange(pearson_corr)
+df
+```
+
+```{r results="asis", echo=FALSE}
+# Grab the normalized expression for the orignal RNA experiment
+norm <- t(data.frame(seurat$RNA@data[rownames(seurat$RNA) %in% df$X, ]))
+Idents(seurat) <- "celltype"
+
+# Random order so that points are plotted randomly and not based on categorical factor
+order <- sample(nrow(saver))
+
+for (gene in df$X) {
+    cat(paste0("## ", gene, "\n"))
+
+    # Scatterplot colored by sample
+    p_sample <- ggplot() +
+        geom_point(aes(x=saver[order, gene], y=norm[order, gene], color=seurat$sample[order])) +
+        theme_classic() +
+        xlab("SAVER imputed") +
+        ylab("Seurat normalized") +
+        labs(color = "Sample") +
+        geom_abline(slope=1, intercept = 0, color="black")
+
+    # Scatterplot colored by celltype
+    p_celltype <- ggplot() +
+        geom_point(aes(x=saver[order, gene], y=norm[order, gene], color=seurat$celltype[order])) +
+        theme_classic() +
+        xlab("SAVER imputed") + ylab("") +
+        labs(color = "Celltype") +
+        geom_abline(slope=1, intercept = 0, color="black")
+
+    p <- cowplot::plot_grid(plotlist = list(p_sample, p_celltype), ncol = 2, labels=gene)
+    subchunkify(p, 10, 20, chunk_name=glue("{gene}-scatter"))
+    cat("\n\n")
+
+    seurat$saver <- as.numeric(saver[, gene])
+    seurat$norm <- unname(norm[, gene])
+
+    # Plot SAVER on UMAP
+    p_saver <- FeaturePlot(seurat, reduction = "umap", "saver") +
+        xlab("UMAP1") +
+        ylab("UMAP2") +
+        ggtitle(glue("SAVER imputed expression")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+            axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+            axis.title=element_text(size=8, face="bold")) +
+        guides(x = axis, y = axis) +
+        theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+            axis.title = element_text(hjust = 0))
+    p_saver <- LabelClusters(p_saver, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+
+
+    # Plot norm on UMAP
+    p_norm <- FeaturePlot(seurat, reduction = "umap", "norm") +
+        xlab("UMAP1") +
+        ylab("UMAP2") +
+        ggtitle(glue("Seurat normalized expression")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+            axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+            axis.title=element_text(size=8, face="bold")) +
+        guides(x = axis, y = axis) +
+        theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+            axis.title = element_text(hjust = 0))
+    p_norm <- LabelClusters(p_norm, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+
+    p <- cowplot::plot_grid(plotlist = list(p_saver, p_norm), ncol = 2, labels=gene)
+    subchunkify(p, 10, 20, chunk_name=glue("{gene}-umap"))
+    cat("\n\n")
+}
+```
+
+## Notes
+
+Some key things that pop out when looking at the scatterplots for each of these genes:
+
+1. There is a discrepency in scaling between SAVER and seurat normalization, meaning we cannot simply compare the values.
+2. Most evident in genes PTGER2 and CLEC2B, the imputed values are showing great differences based upon which sample a cell comes from. To a degree, this makes sense as we know that batch and different conditions can result in technical differences that have to be corrected for. Such a correction may be necessary after using SAVER. These same cells are also showing a degree of stratification based upon celltype which is reassuring to see as we expect cells of the same celltype to follow similar trends to one another.
+3. When looking at the scatterplots, there is a noticeable population of cells that have non-zero SAVER imputed values, but seurat normalized values of 0. This could potentially be SAVER rescuing drouput from the cell or could be the introduction of noise into the dataset. 
+
+# 0 value cells
+
+Dropout is a big problem in single-cell sequencing and there is potential for imputation methods to infer expression from genes that may have originally had no expression. We saw a few instances of this based on the previous section. To see this more concretly, I am contrasting the <b>raw counts</b> against the SAVER values. As a case study, I am looking at the genes MFSD14A, PTGER2, and CLEC2B.
+
+```{r}
+gene <- "MFSD14A"
+
+raw_counts <- seurat$RNA@counts[gene, ]
+ggplot() +
+    geom_point(aes(x=saver[, gene], y=raw_counts, color=seurat$sample)) +
+    theme_classic() +
+    xlab("SAVER imputed") +
+    ylab("Raw counts") +
+    labs(color = "Sample") +
+    ggtitle(gene)
+```
+
+```{r}
+gene <- "PTGER2"
+
+raw_counts <- seurat[gene, ]$RNA@counts
+raw_counts <- t(as.data.frame(raw_counts))
+
+ggplot() +
+    geom_point(aes(x=saver[, gene], y=raw_counts[, gene], color=seurat$sample)) +
+    theme_classic() +
+    xlab("SAVER imputed") +
+    ylab("Raw counts") +
+    labs(color = "Sample") +
+    ggtitle(gene)
+```
+
+
+```{r}
+gene <- "CLEC2B"
+
+raw_counts <- seurat$RNA@counts[gene, ]
+ggplot() +
+    geom_point(aes(x=saver[, gene], y=raw_counts, color=seurat$sample)) +
+    theme_classic() +
+    xlab("SAVER imputed") +
+    ylab("Raw counts") +
+    labs(color = "Sample") +
+    ggtitle(gene)
+```
+
+
+
+
+## Notes
+
+However slight, there are several cells start with 0 raw counts that end up with some expression after SAVER is run. However, there is no concrete way to determine if this is noise or biology with this given dataset. There would need to be auxiliary information where the known values for these genes are pre-determined. In the SAVER paper, they use FISH data as their ground truth values for expression within their datasets to determine if SAVER is introducing noise or recovering signal that is lost in the process of sequencing.
+
+# CD4 vs CD8
+
+CITE-seq datsets have allowed us to gain expression from specific proteins and can be used to easily identify CD4 and CD8 T cells as they typically exclusively express their namesake genes. Therefore we expect to see little to no expression of CD8 in CD4 cells and vice versa. This should continue to be the case even after imputation so I subset the cells to T cells and plotted the expression of CD8 (CD8A and CD8B) vs CD4 to see if the distinction between these two populations is still apparent.
+
+```{r}
+df_saver <- saver[, c("CD4", "CD8A", "CD8B")]
+df_saver$celltype <- seurat$celltype
+df_saver <- df_saver[df_saver$celltype %in% c("CD8+ T cells", "Naive or memory CD4+ T cells"), ]
+
+
+df_norm <- data.frame(t(data.frame(seurat$RNA@data[rownames(seurat$RNA) %in% c("CD4", "CD8A", "CD8B"), ])))
+df_norm$celltype <- seurat$celltype
+df_norm <- df_norm[df_norm$celltype %in% c("CD8+ T cells", "Naive or memory CD4+ T cells"), ]
+
+```
+
+```{r fig.width=20, fig.height=10}
+p_saver <- ggplot(df_saver, aes(x=CD4, y=CD8A, color=celltype) ) +
+    geom_point() +
+    theme_classic() +
+    ggtitle("SAVER")
+
+p_norm <- ggplot(df_norm, aes(x=CD4, y=CD8A, color=celltype) ) +
+    geom_point() +
+    theme_classic() +
+    ggtitle("Seurat normalization")
+
+cowplot::plot_grid(plotlist = list(p_norm, p_saver), ncol = 2)
+```
+
+```{r fig.width=20, fig.height=10}
+p_saver <- ggplot(df_saver, aes(x=CD4, y=CD8B, color=celltype) ) +
+    geom_point() +
+    theme_classic() +
+    ggtitle("SAVER")
+
+p_norm <- ggplot(df_norm, aes(x=CD4, y=CD8B, color=celltype) ) +
+    geom_point() +
+    theme_classic() +
+    ggtitle("Seurat normalization")
+cowplot::plot_grid(plotlist = list(p_norm, p_saver), ncol = 2)
+```
+
+## Notes
+
+While the difference between CD4 and CD8 cells is still apparent in SAVER, it is not as stark as how it appears in the seurat normalization. We can clearly see that the CD4 cells have more expression of CD8 than they inititally did. This is the slighly noise that can be introduced to a dataset through using imputation - however it may be possible to offset these techinical effects by imputing on a per-celltype basis.  
+
+# Potential next steps
+
+Modifying the current dataset to suit our needs:
+
+1. "Punching holes" in the count matrix and seeing how well SAVER is able to recover those manipulated values.
+2. As we have more confidence in the expression of the highly variable genes in this dataset, we can quantify false positives whenever SAVER imputes a 0 to be otherwise
+
+
+Finding a dataset that comes with a ground truth to help us determine how much noise is being introduced into the system:
+
+1. The Azimuth reference dataset with also contains CITE-seq information for some of the cells. James has the valid concern of that surface expression not always correlating with transcription. 
+2. James potentially has some FACS sorted datasets, where they were "looking specifically at the surface genes that the cells were sorted on, CD14, CD3, CD45, CD56, etc.".
+3. The SAVER paper uses a FISH dataset as the ground truth to compare the imputed values against. The paper itself compared the distributions of FISH against drop-seq.

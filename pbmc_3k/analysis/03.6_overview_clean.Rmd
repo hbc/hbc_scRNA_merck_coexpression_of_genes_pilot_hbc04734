@@ -1,0 +1,1511 @@
+---
+title: "Correlation workflow"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+library(CSCORE)
+library(WGCNA)
+library(ggpubr)
+library(ggvenn)
+
+library(SAVER)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+# Overview
+
+The overaching goal of this project is assess different ways of identifying novel co-expressed gene pairs from single-cell RNA-seq datasets. We know that correlations based solely on the normalized RNA expression is not sufficient due to problems with dropout. To address each of these problems, we have been working with a variety of different tools.  The purposes of this report is to pull together each method to determine which works best.
+
+The general workflow is:
+
+1. Normalization/imputation
+  - We use the raw RNA counts to get a normalized count matrix with:
+      1. SCT
+      2. MAGIC
+      3. SAVER
+2. Correlation/Co-expression
+  - With these normalized and imputed matrices we can compute spearman correlations on the corrected dataset (resulting in 3 correlation matrices)
+  - We supply the raw RNA counts to CS-CORE which will provide a co-expression estimate matrix
+3. WGCNA
+  - Establish modules of genes by inputting each co-expression matrix into WGCNA
+
+Next we will quantify how well each approach works with the following metrics:
+
+4. Positive and negative controls
+5. Example of finding new co-expressed genes
+6. Consensus across methods
+
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+A brief reminder of what the dataset looks like:
+
+```{r}
+# Load dataset
+# remotes::install_github("mojaveazure/seurat-disk", quiet=F)
+library(SeuratDisk)
+load(bzfile("../data/seurat_integrated.RData.bz2"))
+
+seurat <- seurat_integrated
+DefaultAssay(seurat) <- "RNA"
+seurat[["SCT"]] <- NULL
+seurat[["integrated"]] <- NULL
+
+rm(seurat_integrated)
+```
+
+```{r}
+Idents(object = seurat) <- "integrated_snn_res.0.8"
+
+seurat <- RenameIdents(object = seurat, 
+                               "0" = "Naive or memory CD4+ T cells",
+                               "1" = "CD14+ monocytes",
+                               "2" = "Activated T cells",
+                               "3" = "CD14+ monocytes",
+                               "4" = "Stressed cells / Unknown",
+                               "5" = "CD8+ T cells",
+                               "6" = "Naive or memory CD4+ T cells",
+                               "7" = "B cells",
+                               "8" = "NK cells",
+                               "9" = "CD8+ T cells",
+                               "10" = "FCGR3A+ monocytes",
+                               "11" = "B cells",
+                               "12" = "NK cells",
+                               "13" = "B cells",
+                               "14" = "Conventional dendritic cells",
+                               "15" = "Megakaryocytes",
+			       "16" = "Plasmacytoid dendritic cells")
+
+seurat$celltype <- Idents(seurat)
+Idents(seurat) <- "celltype"
+```
+
+```{r fig.height=6}
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = celltype,
+            fill=celltype),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle(glue("{name_project}\nCelltypes")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = celltype, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+```{r fig.height=5, fig.width=7}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nCelltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+# Surfaceome genes
+```{r}
+# surfaceome <- read.csv("../data/surfaceome.csv")
+
+# library('biomaRt')
+# mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+# gene_IDs <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"),
+#               values = surfaceome$ENSEMBL.Gene.ID, mart= mart)
+
+# surfaceome_genes <- left_join(x = surfaceome, y = gene_IDs, by = c("ENSEMBL.Gene.ID" = "ensembl_gene_id"))
+# surfaceome_genes <- surfaceome_genes$hgnc_symbol
+
+# surfaceome_genes <- rownames(seurat$RNA)[rownames(seurat$RNA) %in% surfaceome_genes]
+
+# write.csv(surfaceome_genes, "../data/surfaceome_genes.csv")
+
+surfaceome_genes <- read.csv("../data/surfaceome_genes.csv")$x
+as.data.frame(surfaceome_genes)
+```
+
+## Select markers
+
+We are going to use a handful of known CD8 (positive controls) and a variety of other celltype (negative controls) markers to evaluate how well each method works. Here we can see the expression distribution of genes based upon the RNA log normalized expression (not SCTranformed yet).
+
+```{r}
+# df <- FindMarkers(seurat, assay="RNA", only.pos=TRUE)
+# write.csv(df, "genes.csv")
+# df <- read.csv("genes.csv")
+
+# cd8 <- df[df$cluster == "CD8+ T cells", ]
+# cd4 <- df[df$cluster == "Naive or memory CD4+ T cells", ]
+# b <- df[df$cluster == "B cells", ]
+```
+
+```{r fig.width=15}
+markers <- list()
+
+markers[["CD8"]] <- c("CCL5", "CST7", "GZMB", "CD8A", "PRF1", "CD3D")
+# markers[["CD4"]] <- c("CD4", "LEF1", "CD3E", "CD3G", "IL7R")
+markers[["B"]] <- c("CD79A", "MS4A1", "IGHM")
+markers[["Monocytes"]] <- c("CD14", "LYZ", "FCGR3A", "MS4A7")
+
+anno_colors <- list(celltype = c("B"="red", "CD8"="blue", "Monocytes"="green"))
+
+genes <- unname(unlist(markers))
+surfaceome_genes <- unique(c(surfaceome_genes, genes))
+
+# Manually remove B2M because it is an outlier that skews the data
+surfaceome_genes <- surfaceome_genes[surfaceome_genes != "B2M"]
+
+DotPlot(seurat, markers)
+```
+
+```{r}
+# Dataframe of gene markers
+genes_label <- c()
+for (marker in names(markers)) {
+  g <- markers[[marker]]
+  names(g) <- rep(marker, length(g))
+
+  genes_label <- c(genes_label, g)
+}
+genes_label <- data.frame(gene=genes_label, celltype=names(genes_label)) %>% column_to_rownames(var="gene")
+```
+
+# Subset to CD8 T cells
+
+Since this is a testing ground for the workflow, I am going to subset the dataset to just the CD8 T cells to simplify this exercise. During this step I am re-running SCTransform on the subsetted data. 
+
+```{r}
+seurat <- subset(seurat, subset = (celltype == "CD8+ T cells"))
+
+# Removing genes that have 0 counts across all cells of the celltype
+counts <- seurat[["RNA"]]@counts
+genes.use <- rowSums(counts) > 0
+genes.use <- names(genes.use[genes.use])
+seurat <- seurat[genes.use, ]
+rm(counts)
+
+# Get the updated list of surfaceome genes for these cells
+surfaceome_genes <- surfaceome_genes[surfaceome_genes %in% row.names(seurat[["RNA"]])]
+genes <- genes[genes %in% surfaceome_genes]
+
+# Re-run SCT with hvgs set as surfaceome genes to make sure that they get normalized
+VariableFeatures(seurat) <- surfaceome_genes
+seurat <- SCTransform(seurat, return.only.var.genes=TRUE, variable.features.n=length(surfaceome_genes))
+```
+
+Additionally, I am going to select the top 100 genes (within the surfaceome gene list) based upon average expression and number of cells it is expressed in. Similarly, I am taking the bottom 50. So in total, we will be running this pipeline around 150 genes + selected marker genes (which are labelled in red). I am subsetting the genes for the sake of saving time for this report as we define best practices.
+
+```{r fig.height=5, fig.width=8}
+data_sct <- FetchData(seurat[["SCT"]], vars=surfaceome_genes)
+
+# Number of cells a gene is expressed in
+# Average expression of a gene
+num_cells <- colSums(data_sct > 0)
+avg_expression <- colMeans(data_sct)
+
+df_genes <- data.frame(num_cells=num_cells, avg_expression=avg_expression)
+df_genes$gene <- row.names(df_genes)
+
+# Select top 100 and bottom 50 genes based on expression and ncells
+df_genes <- df_genes[with(df_genes, order(avg_expression, num_cells)), ]
+surfaceome_genes <- c(sample_n(df_genes, 100)$gene, tail(df_genes, 50)$gene)
+surfaceome_genes <- unique(c(surfaceome_genes, genes))
+
+ggplot(df_genes, aes(x=num_cells, y=avg_expression)) +
+  geom_point() +
+  theme_classic() +
+  geom_text(aes(label=ifelse(gene %in% genes, as.character(gene), '')), hjust=-0.1, vjust=0.1, color="red")
+```
+
+Here we can see the distribution of the celltype marker genes we identified before.
+
+```{r}
+# Marker gene metrics
+df_genes[df_genes$gene %in% genes, ]
+```
+
+# Normalization/Imputation
+
+We compare three alternative methods of estimating expression levels to log normalization and assess their ability to account for dropout.
+
+1. SCTransform (raw counts -> normalized counts)
+2. MAGIC (raw counts -> imputed, normalized counts)
+3. SAVER (raw counts -> imputed, normalized counts)
+
+I show the average expression for each gene across all CD8 cells in the next section.
+
+```{r}
+# Get raw counts
+raw_rna <- FetchData(seurat[["RNA"]], vars=surfaceome_genes, layer="counts")
+
+# LOG NORMALIZATION
+data_rna <- FetchData(seurat[["RNA"]], vars=surfaceome_genes, layer="data")
+
+# SCT
+data_sct <- FetchData(seurat[["SCT"]], vars=surfaceome_genes, layer="data")
+
+# MAGIC
+# Load conda environment
+myenvs <- reticulate::conda_list()
+envname <- myenvs$name[3]
+reticulate::use_condaenv(envname, required = TRUE)
+library(Rmagic)
+data_magic <- magic(raw_rna)$result
+
+# SAVER
+# Generate SAVER predictions for those genes
+data_saver <- saver(t(raw_rna), estimates.only = TRUE, ncores=8)
+data_saver <- data.frame(t(data_saver))
+```
+
+```{r}
+# Put all matrices in a list for easy access
+data_list <- list(data_rna, data_sct, data_magic, data_saver)
+names(data_list) <- c("rna", "sct", "magic", "saver")
+```
+
+## Average expression after normalization/imputation
+
+Here I am representing the averaged expression of the 150+ genes for each method (where values are scaled by method/column).
+
+```{r}
+df_avg_impute <- data.frame(surfaceome_genes) %>% rename(gene = surfaceome_genes)
+
+# For each method, calculate the average expression for each gene
+for (method in names(data_list)) {
+    df <- data_list[[method]]
+    df <- data.frame(colMeans(df))
+    colnames(df) <- c(method)
+    df$gene <- rownames(df)
+
+    df_avg_impute <- merge(df_avg_impute, df)
+}
+
+df_avg_impute <- df_avg_impute %>% column_to_rownames(var="gene")
+pheatmap(df_avg_impute,  cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = FALSE, scale="column")
+```
+
+Subsetting the above heatmap to just the marker genes.
+
+```{r}
+pheatmap(df_avg_impute[genes, ], annotation_row = genes_label,  cluster_rows = TRUE, cluster_cols = TRUE, 
+            show_rownames = TRUE, display_numbers = round(df_avg_impute[genes, ],2), scale="column",
+            annotation_colors=anno_colors)
+```
+
+Here I am comparing the average expression for each method (SCT, MAGIC, SAVER) against the log normalized RNA expression to visualize how expression has changed.
+
+```{r fig.width=18, fig.height=5}
+df_avg_impute$gene <- rownames(df_avg_impute)
+
+plot_list <- list()
+idx <- 1
+
+# SCT
+p <- ggplot(df_avg_impute, aes(x=rna, y=sct)) +
+        geom_point() +
+        theme_classic() +
+        ggtitle("SCT") +
+        geom_text(aes(label=ifelse(gene %in% genes, as.character(gene), '')), 
+                        hjust=-0.1, vjust=0.1, color="red") 
+plot_list[[idx]] <- p
+idx <- idx + 1
+
+# MAGIC
+p <- ggplot(df_avg_impute, aes(x=rna, y=magic)) +
+        geom_point() +
+        theme_classic() +
+        ggtitle("MAGIC") +
+        geom_text(aes(label=ifelse(gene %in% genes, as.character(gene), '')), 
+                        hjust=-0.1, vjust=0.1, color="red")
+plot_list[[idx]] <- p
+idx <- idx + 1
+
+# SAVER
+p <- ggplot(df_avg_impute, aes(x=rna, y=saver)) +
+        geom_point() +
+        theme_classic() +
+        ggtitle("SAVER") +
+        geom_text(aes(label=ifelse(gene %in% genes, as.character(gene), '')), 
+                        hjust=-0.1, vjust=0.1, color="red")
+plot_list[[idx]] <- p
+idx <- idx + 1
+
+cowplot::plot_grid(plotlist = plot_list, ncol=3)
+```
+
+## Conclusions
+
+The general structure of the data remains consistent regardless of which normalization/imputation method we use. In this example we want the CD8 markers to remain highly expressed while also seeing low values for the remaining markers. Additionally we see that general trends for these genes remains consistent across each method (as seen in the scatterplot), but that the scale shifts instead.
+
+# Correlation/Co-expression
+
+We have a few different ways to compute correlation scores with their associated p-values:
+
+1. Spearman correlation 
+  - SCTransform counts -> spearman correlation matrix
+  - MAGIC imputed -> spearman correlation matrix
+  - SAVER imputed -> spearman correlation matrix
+2. CS-CORE 
+    - Raw RNA counts -> co-expression matrix
+
+```{r}
+# # Compute spearman correlation for each method
+p_corr_list <- list()
+corr_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    gene_1_method <- c()
+    gene_2_method <- c()
+    corr_method <- c()
+    p_method <- c()
+
+    # Iterate over very gene pair
+    for (gene_1 in surfaceome_genes) {
+        for (gene_2 in surfaceome_genes) {
+
+            gene_1_method <- c(gene_1_method, gene_1)
+            gene_2_method <- c(gene_2_method, gene_2)
+
+            gene_1_exp <- data[[gene_1]]
+            gene_2_exp <- data[[gene_2]]
+
+            # If a gene has no expression, set correlation = 0 and p-value = 1
+            if ((length(gene_1_exp) == 0) | (length(gene_2_exp) == 0 | all(gene_1_exp == 0) | all(gene_2_exp == 0))) {
+                corr_method <- c(corr_method, 0)
+                p_method <- c(p_method, 1)
+            } else {
+                # Calculate spearman correlation and p-value
+                tmp <- cor.test(gene_1_exp, gene_2_exp, method="spearman", exact=F)
+                corr_method <- c(corr_method, unname(tmp$estimate))
+                p_method <- c(p_method, tmp$p.value)
+            }
+        }
+    }
+
+    # Data wrangling to put into matrix format
+    corr <- data.frame(Var1=gene_1_method, Var2=gene_2_method, value=corr_method)
+    corr <- reshape2::dcast(corr, Var2 ~ Var1)
+    rownames(corr) <- corr$Var2 
+    corr <- subset(corr, select = -c(Var2))
+
+    p_corr <- data.frame(Var1=gene_1_method, Var2=gene_2_method, value=p_method)
+    p_corr <- reshape2::dcast(p_corr, Var2 ~ Var1)
+    rownames(p_corr) <- p_corr$Var2 
+    p_corr <- subset(p_corr, select = -c(Var2))
+
+    # Store results
+    p_corr_list[[method]] <- as.matrix(p_corr)
+    corr_list[[method]] <- as.matrix(corr)
+
+}
+```
+
+```{r}
+# Run CS-CORE
+CSCORE_result <- CSCORE(seurat, genes = surfaceome_genes)
+
+corr_list[["cscore"]] <- CSCORE_result$est
+p_corr_list[["cscore"]] <- CSCORE_result$p_value
+```
+
+## Correlation distribution
+
+Here I show the distribution of correlation scores for each method.
+
+```{r fig.height=10, fig.width=15}
+df_melt <- data.frame()
+
+for (method in names(corr_list)) {
+    df <- reshape2::melt(corr_list[[method]])
+    df$method <- method
+
+    df_melt <- rbind(df_melt, df)
+}
+
+ggplot(df_melt, aes(x=value, fill=method)) +
+    geom_histogram(alpha=0.3, position="identity", bins=50) +
+    theme_classic() +
+    facet_wrap(vars(method)) +
+    NoLegend()
+```
+
+## p-value distribution
+
+Here I show the distribution of p-values from the correlation/co-expression estimates for each method.
+
+```{r}
+df_melt <- data.frame()
+
+for (method in names(p_corr_list)) {
+    df <- reshape2::melt(p_corr_list[[method]])
+    df$method <- method
+
+    df_melt <- rbind(df_melt, df)
+}
+
+ggplot(df_melt, aes(x=value, fill=method)) +
+    geom_histogram(alpha=0.3, position="identity", bins=50) +
+    theme_classic() +
+    facet_wrap(vars(method)) +
+    NoLegend()
+```
+
+# WGCNA modules
+
+WGCNA identifies modules of highly correlated genes, which can help us identify candidate gene pairs with high lilelihood of coexpression. We can supply either the CS-CORE correlation estimate or the spearman correlation matrix to compare methods. 
+
+Additionally, I am optimizing a "soft thresholding" parameter as well as a few other parameters within WGCNA. I am still in the process of selecting the best parameters for MAGIC and SAVER (the authors of CS-CORE provided parameters that already work well).
+
+For each method I am plotting the <b>heatmap of correlation/co-expression estimates with non-significant pairs set to the value 0 (BH adjust matrix) </b> - this was the matrix used as input for WGCNA. I am showing the fully set of 150+ genes first with annotations and later just the marker genes.
+
+```{r}
+run_wgcna <- function(mtx_coex, mtx_pval, genes, power) {
+  # Obtain BH-adjusted p values
+  p_matrix_BH <- matrix(0, length(genes), length(genes))
+  p_matrix_BH[upper.tri(p_matrix_BH)] <- p.adjust(mtx_pval[upper.tri(mtx_pval)], method = "BH")
+  p_matrix_BH <- p_matrix_BH + t(p_matrix_BH)
+
+  # Set co-expression entires with BH-adjusted p-values greater than 0.05 to 0
+  mtx_coex[p_matrix_BH > 0.05] <- 0
+
+  adj <- WGCNA::adjacency.fromSimilarity(abs(mtx_coex), power = power)
+
+  # Compute the topological overlap matrix
+  TOM <- WGCNA::TOMsimilarity(adj)
+  dissTOM <- 1 - TOM
+  rownames(dissTOM) <- colnames(dissTOM) <- genes
+  # Run hierarchical clustering as in the WGCNA workflow
+  hclust_dist <- hclust(as.dist(dissTOM), method = "average") 
+  memb <- dynamicTreeCut::cutreeDynamic(dendro = hclust_dist, 
+                      distM = dissTOM, 
+                      deepSplit = 2,
+                      pamRespectsDendro = FALSE,
+                      minClusterSize = 20)
+
+  # For more instructions on how to tune the parameters in the WGCNA workflow,
+  # please refer to https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/
+
+  names(memb) <- genes
+  memb_tab <- table(memb)
+  module_list <- lapply(sort(unique(memb)), function(i_k) names(which(memb == i_k)))
+
+  module_df <- data.frame(memb)
+  module_df$memb <- as.character(module_df$memb)
+  df <- module_df
+  df <- tibble::rownames_to_column(df, "gene")
+  colnames(df) <- c("gene", "module")
+
+  # Return both the modules and BH-adjust matrix
+  results <- list()
+  results[["wgcna"]] <- df
+  results[["bh_mtx"]] <- mtx_coex
+
+  return(results)
+}
+```
+
+```{r}
+# Soft threshold parameters for WGCNA
+power_list <- list()
+power_list[["rna"]] <- 2
+power_list[["sct"]] <- 1
+power_list[["magic"]] <- 1
+power_list[["saver"]] <- 4
+power_list[["cscore"]] <- 1
+```
+
+```{r}
+wgcna_list <- list()
+bh_mtx_list <- list()
+
+for (method in names(corr_list)) {
+    corr <- corr_list[[method]]
+    p_corr <- p_corr_list[[method]]
+    power <- power_list[[method]]
+
+    # Run WGCNA
+    results <- run_wgcna(corr, p_corr, surfaceome_genes, power=power)
+    wgcna_list[[method]] <- results$wgcna
+    bh_mtx_list[[method]] <- results$bh_mtx
+}
+```
+
+```{r results="asis", echo=FALSE}
+for (method in names(bh_mtx_list)) {
+    method_title <- str_replace(method, "rna", "Log normalization")
+
+    print(glue("## {method_title}\n"))
+
+    wgcna <- wgcna_list[[method]]
+    bh_mtx <- bh_mtx_list[[method]]
+
+    # Plot heatmap of all surfaceome genes
+    rownames(wgcna) <- wgcna$gene
+    anno <- wgcna[, "module", drop=F]
+    p <- pheatmap(bh_mtx, annotation_row=anno, annotation_col=anno, show_rownames = F, show_colnames = F, silent=F)
+    print(p)
+    cat("\n\n")
+
+    # Plot heatmap of celltype markers
+    anno <- merge(anno, genes_label, by=0) %>% column_to_rownames(var="Row.names")
+    p <- pheatmap(bh_mtx[genes, genes], annotation_row=anno, annotation_col=anno, silent=F, annotation_colors=anno_colors)
+    print(p)
+    cat("\n\n")
+}
+```
+
+## Conclusions
+
+With the MAGIC, SAVER, and CS-CORE heatmaps we can see patterns of high co-expression among the genes that is not present in the log normalized and SCT co-expression matrices. 
+
+I have not finalized the best parameters for WGCNA, so for the time being I will be disregarding the module agreement among co-expressed genes in the later sections of this report.
+
+# Controls
+
+Here we are using the marker genes from before to see how well each method does. 
+
+For each gene pair, we have the following information for each method:
+
+- Number of cells each gene is expressed in
+- Average expression of each gene
+- Co-expression/correlation scores
+- Module agreement
+
+
+```{r}
+# Number of cells a gene is expressed in across each method
+comp_n_cells <- data.frame(surfaceome_genes) %>% rename(gene=surfaceome_genes)
+
+for (method in names(data_list)) {
+
+    df <- data_list[[method]]
+    df <- data.frame(colSums(df > 0))
+    colnames(df) <- method
+    df$gene <- rownames(df)
+
+    comp_n_cells <- merge(comp_n_cells, df)
+}
+```
+
+```{r}
+# WGCNA module assignment across each method
+
+comp_modules <- data.frame(surfaceome_genes) %>% rename(gene=surfaceome_genes)
+
+for (method in names(wgcna_list)) {
+    wgcna <- wgcna_list[[method]]
+    colnames(wgcna) <- c("gene", method)
+
+    comp_modules <- merge(comp_modules, wgcna)
+}
+```
+
+```{r}
+# Average gene expression across each method
+
+comp_avg <- df_avg_impute
+comp_avg$gene <- rownames(comp_avg)
+
+cols_round <- c("rna", "sct", "magic", "saver")
+comp_avg[cols_round] <- round(comp_avg[cols_round], 3)
+```
+
+```{r}
+# Co-expression/correlation scores for each method
+comp_corr <- reshape2::melt(bh_mtx_list[["rna"]]) %>% rename(rna=value)
+
+for (method in c("sct", "magic", "saver", "cscore")) {
+    df <- bh_mtx_list[[method]]
+    df <- reshape2::melt(df)
+    colnames(df) <- c("Var1", "Var2", method)
+
+    comp_corr <- merge(comp_corr, df)
+}
+
+cols_round <- c("rna", "sct", "magic", "saver", "cscore")
+comp_corr[cols_round] <- round(comp_corr[cols_round], 3)
+```
+
+```{r}
+# Co-expression/correlation p-values for each method
+comp_p_corr <- reshape2::melt(as.matrix(p_corr_list[["rna"]])) %>% rename(rna=value)
+
+for (method in c("sct", "magic", "saver", "cscore")) {
+    df <- as.matrix(p_corr_list[[method]])
+    df <- reshape2::melt(df)
+    colnames(df) <- c("Var1", "Var2", method)
+
+    comp_p_corr <- merge(comp_p_corr, df)
+}
+
+cols_round <- c("rna", "sct", "magic", "saver", "cscore")
+comp_p_corr[cols_round] <- round(comp_p_corr[cols_round], 3)
+```
+
+## CCL5 + CD3D (CD8 + CD8)
+
+```{r}
+gene_1 <- "CCL5"
+gene_2 <- "CD3D"
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}"))
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+## CST7 + GZMB (CD8 + CD8)
+
+```{r}
+gene_1 <- "CST7"
+gene_2 <- "GZMB"
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+
+
+## CD79A + CD3D (B + CD8)
+
+```{r}
+gene_1 <- "CD79A"
+gene_2 <- "CD3D"
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+## CD14 + CD79A (Monocyte + B)
+
+```{r}
+gene_1 <- "CD14"
+gene_2 <- "CD79A"
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+# Conclusions
+
+We can clearly see from each scatterplot that log normalization and SCT are not sufficient methods for evaluating correlation as the problem of dropout causes low correlation scores for pairs we know are co-expressed. However, MAGIC apepars a bit inconsistent and has given high correlation scores for genes we know are not correlated (CD79A + CD3D). On the other hand, SAVER and CS-CORE seem to be giving relatively similar scores for each example.
+
+So now we can ask the question, if we did not know any of these controls, what gene pairs would be picked up as the top co-expressed genes?
+
+# Top correlated gene for each method
+
+Previewing the top correlated gene pairs for each method to evaluate how well each method does without having any known information.
+
+```{r}
+comp_corr_sub <- comp_corr %>% subset(Var1 != Var2)
+```
+
+## Log normalization
+
+Top 5 spearman correlation scores from the log-normalized expression and showing each metric for the top hit.
+
+```{r}
+df <- head(comp_corr_sub %>% arrange(desc(rna)), 10)
+
+idx <- t(apply(df[, c("Var1", "Var2")], 1, sort))
+df <- cbind(idx, df[c("rna", "sct", "magic", "saver", "cscore")])
+df <- unique(df) %>% rename(Var1=1, Var2=2)
+
+df
+```
+
+```{r results="asis"}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+print(glue("### {gene_1} + {gene_2}\n"))
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+
+## SCT
+
+Top 5 spearman correlation scores from the SCTransformed expression and showing each metric for the top hit.
+
+
+```{r}
+df <- head(comp_corr_sub %>% arrange(desc(sct)), 10)
+
+idx <- t(apply(df[, c("Var1", "Var2")], 1, sort))
+df <- cbind(idx, df[c("rna", "sct", "magic", "saver", "cscore")])
+df <- unique(df) %>% rename(Var1=1, Var2=2)
+
+df
+```
+
+```{r results="asis"}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+print(glue("### {gene_1} + {gene_2}\n"))
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+## MAGIC
+
+Top 5 spearman correlation scores from the MAGIC imputed expression and showing each metric for the top hit.
+
+```{r}
+df <- head(comp_corr_sub %>% arrange(desc(magic)), 10)
+
+idx <- t(apply(df[, c("Var1", "Var2")], 1, sort))
+df <- cbind(idx, df[c("rna", "sct", "magic", "saver", "cscore")])
+df <- unique(df) %>% rename(Var1=1, Var2=2)
+
+df
+```
+
+```{r results="asis"}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+print(glue("### {gene_1} + {gene_2}\n"))
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+## SAVER
+
+Top 5 spearman correlation scores from the SAVER imputed expression and showing each metric for the top hit.
+
+
+```{r}
+df <- head(comp_corr_sub %>% arrange(desc(saver)), 10)
+
+idx <- t(apply(df[, c("Var1", "Var2")], 1, sort))
+df <- cbind(idx, df[c("rna", "sct", "magic", "saver", "cscore")])
+df <- unique(df) %>% rename(Var1=1, Var2=2)
+
+df
+```
+
+```{r results="asis"}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+print(glue("### {gene_1} + {gene_2}\n"))
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+```{r results="asis"}
+gene_1 <- as.character(df$Var1[2])
+gene_2 <- as.character(df$Var2[2])
+
+
+print(glue("### {gene_1} + {gene_2}\n"))
+```
+
+
+If the average expression of both genes are low, sometimes the spearman correlation score will be high as it determines that both genes are similarly lowly expressed. As a result, we will have to determine which average expression values to filter pairs on.
+
+When I look at this next top pair with a higher average expression score, we see results that are more in line with our expectations.
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+## CS-CORE
+
+Top 5 CS-CORE co-expression estimates and showing each metric for the top hit.
+
+
+```{r}
+df <- head(comp_corr_sub %>% arrange(desc(cscore)))
+
+idx <- t(apply(df[, c("Var1", "Var2")], 1, sort))
+df <- cbind(idx, df[c("rna", "sct", "magic", "saver", "cscore")])
+df <- unique(df) %>% rename(Var1=1, Var2=2)
+
+df
+```
+
+```{r results="asis"}
+gene_1 <- as.character(df$Var1[1])
+gene_2 <- as.character(df$Var2[1])
+
+print(glue("### {gene_1} + {gene_2}\n"))
+```
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+```{r results="asis"}
+gene_1 <- as.character(df$Var1[3])
+gene_2 <- as.character(df$Var2[3])
+
+print(glue("### {gene_1} + {gene_2}\n"))
+```
+
+I noticed the the gene AQP9 kept on popping up in the top correlated genes for CS-CORE with co-expression estimate of 1.0. Here we can take a look at one of the pairs to determine what is going on here. 
+
+Based on these results, it seems like CS-CORE struggles when there are very few cells that express a gene (as seen in the rna column for n_cells). Logically this makes sense as we do not want to make too many assumptions based upon little data. As a result, we should determine a minimum number of cells threshold to filter results by in order to retain high quality co-expressed pairs.
+
+```{r}
+cols <- c("metric", "gene", "rna", "sct", "magic", "saver", "cscore")
+
+n_cells <- comp_n_cells %>% subset(gene %in% c(gene_1, gene_2))
+n_cells$cscore <- NA
+n_cells$metric <- "n_cells"
+
+avg <- comp_avg %>% subset(gene %in% c(gene_1, gene_2))
+
+avg$cscore <- NA
+avg$metric <- "avg"
+
+module <- comp_modules %>% subset(gene %in% c(gene_1, gene_2))
+module$metric <- "module"
+
+summary_1 <- rbind(n_cells, avg, module)
+summary_1[cols] %>% remove_rownames()
+```
+
+```{r}
+corr <- comp_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(corr) <- "correlation"
+p_corr <- comp_p_corr %>% subset((Var1 == gene_1) & (Var2 == gene_2))
+rownames(p_corr) <- "p-value"
+
+rbind(corr, p_corr)
+```
+
+```{r fig.height=10, fig.width=10}
+plot_list <- list()
+
+for (method in names(data_list)) {
+    data <- data_list[[method]]
+
+    corr_method <- round(corr[[method]], 1)
+    p_corr_method <- p_corr[method]
+    color <- "black"
+   
+
+    p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2))) +
+            geom_point(color=color) +
+            theme_classic() +
+            xlab(gene_1) + ylab(gene_2) +
+            ggtitle(glue("{method}: correlation = {corr_method}")) 
+            
+    plot_list[[method]] <- p
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+# CS-CORE vs SAVER
+
+SAVER seems to agree generally with CS-CORE results so I wanted to determine how much there is consensus between the two methods. 
+
+Here, I am filtering on genes with average expression lower 0.2 than and number of cells less than 100.
+
+```{r}
+genes_ncells <- comp_n_cells %>% subset(rna > 50)
+genes_ncells <- genes_ncells$gene
+
+genes_avg <- comp_avg %>% subset(saver > 0.2)
+genes_avg <- genes_avg$gene
+
+genes_sub <- intersect(genes_ncells, genes_avg)
+
+df <- comp_corr %>% subset((Var1 %in% genes_sub) & (Var2 %in% genes_sub))
+df <- df %>% subset(Var1 != Var2)
+
+idx <- t(apply(df[, c("Var1", "Var2")], 1, sort))
+df <- cbind(idx, df[c("sct", "magic", "saver", "cscore")])
+df <- unique(df) %>% rename(Var1=1, Var2=2)
+
+ggplot(df, aes(x=saver, y=cscore)) +
+    geom_point() + 
+    theme_classic() +
+    geom_abline(intercept = 0, slope = 1, color="red")
+```
+
+
+# Final conclusions
+
+SAVER and CS-CORE seem to be the best methods for evaluating co-expression. Using both together will provide the most comprehensive look at co-expression within a dataset.
+
+# Inputs and outputs
+
+To run this analysis from start to end, you need to provide a seurat object with celltypes annotated.
+
+The code will then run each step with the following output:
+
+1. Normalization/Imputation: seurat -> normalized/imputed matrix
+2. QC metrics (ncells, avg expression): normalized/imputed matrix -> metrics dataframe
+3. Spearman correlation: normalized/imputed matrix -> correlation matrix + p-values
+4. CS-CORE: seurat -> co-expression estimates + p-values
+5. WGCNA: correlation matrix -> gene:module mapping dataframe (added to QC metrics dataframe)
+
+I store each of these outputs into dataframes that are easy to navigate and subset. 
+
+# Next steps
+
+1. The next steps are to evaluate where CS-CORE and SAVER differ in results from one another to determine which method is best to use in certain scenarios.
+
+2. I will be tweaking WGCNA parameters to find what best suits each method.
+
+3. Additionally, we can run this same analysis with:
+    - The full set of surfaceome genes
+    - Other celltypes in this dataset
+    - Other datasets (FACs sorted and protein datasets already available)

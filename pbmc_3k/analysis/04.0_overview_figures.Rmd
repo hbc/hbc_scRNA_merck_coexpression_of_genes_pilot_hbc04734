@@ -1,0 +1,1189 @@
+---
+title: "Workflow overview"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+# Parameters to set in advance
+
+celltype of interest
+filter genes based on thresholds
+
+```{r}
+ct <- "CD8+ T cells"
+filter <- TRUE
+```
+
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+library(CSCORE)
+library(WGCNA)
+library(ggpubr)
+library(ggvenn)
+
+library(SAVER)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+theme_arrow <- function() {
+    axis <- ggh4x::guide_axis_truncated(
+        trunc_lower = unit(0, "npc"),
+        trunc_upper = unit(3, "cm")
+    )
+
+    list(
+        theme_classic() +
+        theme(plot.title=element_text(hjust = 0.5, face="bold")) +
+        theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) +
+        theme(axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+        theme(axis.title=element_text(size=10, face="bold", hjust=0)) +
+        theme(axis.line = element_line(arrow = arrow(type="closed", length=unit(0.5, "cm")), linewidth = 1)),
+        guides(x=axis, y=axis)
+    )
+}
+
+#' Create sub-chunks for plots
+#'
+#' taken from: https://stackoverflow.com/questions/15365829/dynamic-height-and-width-for-knitr-plots
+#'
+#' @param pl a plot object
+#' @param fig.height figure height
+#' @param fig.width figure width
+#' @param chunk_name name of the chunk
+#'
+#' @author Andreas Scharmueller \email{andschar@@protonmail.com}
+#'
+subchunkify = function(pl,
+                       fig.height = 7,
+                       fig.width = 5,
+                       chunk_name = 'plot') {
+  pl_deparsed = paste0(deparse(function() {
+    pl
+  }), collapse = '')
+  
+  sub_chunk = paste0(
+    "```{r ",
+    chunk_name,
+    ", fig.height=",
+    fig.height,
+    ", fig.width=",
+    fig.width,
+    ", dpi=72",
+    ", echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}",
+    "\n(",
+    pl_deparsed,
+    ")()",
+    "\n```"
+  )
+  
+  cat(knitr::knit(
+    text = knitr::knit_expand(text = sub_chunk),
+    quiet = TRUE
+  ))
+  cat("\n\n")
+}
+```
+
+# Overview
+
+The overaching goal of this project is to assess different ways of identifying novel co-expressed gene pairs from single-cell RNA-seq datasets. We know that correlations based on the normalized RNA expression are not accurate due to dropout. 
+
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+```{r}
+path_outs <- "04.0_overview_figures"
+```
+
+<b>Dataset background</b>
+
+I have pulled the dataset from the single-cell RNA-seq tutorial that we host at the core. More information about this dataset and how it processed can be found in the tutorial we have available on our website:
+
+https://hbctraining.github.io/scRNA-seq_online/schedule/
+
+The basic processing information for this sample includes:
+
+- The libraries were prepared using 10X Genomics version 2 chemistry
+- The samples were sequenced on the Illumina NextSeq 500
+- PBMC samples from eight individual lupus patients were separated into two aliquots each.
+- One aliquot of PBMCs was activated by 100 U/mL of recombinant IFN-β for 6 hours.
+- The second aliquot was left untreated.
+- After 6 hours, the eight samples for each condition were pooled together in two final pools (stimulated cells and control cells). We will be working with these two, pooled samples. 
+- 12,138 and 12,167 cells were identified (after removing doublets) for control and stimulated pooled samples, respectively.
+
+A brief overview of what the dataset looks like:
+
+
+```{r}
+# Load dataset
+# remotes::install_github("mojaveazure/seurat-disk", quiet=F)
+library(SeuratDisk)
+load(bzfile("../data/seurat_integrated.RData.bz2"))
+
+seurat <- seurat_integrated
+DefaultAssay(seurat) <- "RNA"
+seurat[["SCT"]] <- NULL
+seurat[["integrated"]] <- NULL
+
+rm(seurat_integrated)
+```
+
+```{r}
+Idents(object = seurat) <- "integrated_snn_res.0.8"
+
+seurat <- RenameIdents(object = seurat, 
+                               "0" = "Naive or memory CD4+ T cells",
+                               "1" = "CD14+ monocytes",
+                               "2" = "Activated T cells",
+                               "3" = "CD14+ monocytes",
+                               "4" = "Stressed cells / Unknown",
+                               "5" = "CD8+ T cells",
+                               "6" = "Naive or memory CD4+ T cells",
+                               "7" = "B cells",
+                               "8" = "NK cells",
+                               "9" = "CD8+ T cells",
+                               "10" = "FCGR3A+ monocytes",
+                               "11" = "B cells",
+                               "12" = "NK cells",
+                               "13" = "B cells",
+                               "14" = "Conventional dendritic cells",
+                               "15" = "Megakaryocytes",
+			       "16" = "Plasmacytoid dendritic cells")
+
+seurat$celltype <- Idents(seurat)
+Idents(seurat) <- "celltype"
+```
+
+```{r fig.height=6}
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = celltype,
+            fill=celltype),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle(glue("{name_project}\nCelltypes")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = celltype, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+```{r fig.height=5, fig.width=7}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    theme_arrow() +
+    ggtitle(glue("{name_project}\nCelltypes"))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+# Zooming in on `r ct` and surfaceome genes
+
+## Subset to celltype
+
+```{r}
+seurat <- subset(seurat, celltype == ct)
+
+# Removing genes that have 0 counts across all cells of the celltype
+counts <- seurat[["RNA"]]@counts
+genes.use <- rowSums(counts) > 0
+genes.use <- names(genes.use[genes.use])
+seurat <- seurat[genes.use, ]
+rm(counts)
+```
+
+```{r}
+# saveRDS(seurat, glue("{path_outs}/seurat.RDS"))
+
+seurat <- readRDS(glue("{path_outs}/seurat.RDS"))
+```
+
+## Surfaceome genes
+
+```{r}
+surfaceome_genes <- read.csv("../data/surfaceome_genes.csv")$x
+
+# Get the updated list of surfaceome genes found in the dataset
+genes.use <- rownames(seurat)
+surfaceome_genes_all <- surfaceome_genes[surfaceome_genes %in% genes.use]
+as.data.frame(surfaceome_genes_all)
+```
+
+## Known markers
+
+Using some known markers as positive and negative controls for validation.
+
+```{r }
+markers <- list()
+
+markers[["CD8"]] <- c("CCL5", "CST7", "GZMB", "CD8A", "PRF1", "CD3D")
+markers[["B"]] <- c("CD79A", "MS4A1", "IGHM")
+markers[["Monocytes"]] <- c("CD14", "LYZ", "FCGR3A", "MS4A7")
+
+genes <- unname(unlist(markers))
+
+# Dataframe of gene markers
+# For clearer plots later on
+genes_label <- c()
+for (marker in names(markers)) {
+  g <- markers[[marker]]
+  names(g) <- rep(marker, length(g))
+
+  genes_label <- c(genes_label, g)
+}
+genes_label <- data.frame(gene=genes_label, celltype=names(genes_label)) %>% column_to_rownames(var="gene")
+anno_colors <- list(celltype = c("B"="red", "CD8"="blue", "Monocytes"="green"))
+
+genes_label
+```
+
+
+# The dropout problem
+
+```{r fig.height=9, fig.width=15}
+# Get RNA expression counts
+data_rna <- FetchData(seurat[["RNA"]], vars=genes)
+
+# Unique combination of each gene pair
+genes_comb <- data.frame(t(combn(markers[["CD8"]], 2)))
+
+plot_list <- list()
+for (idx in 1:nrow(genes_comb)) {
+    gene_1 <- genes_comb[idx, 1]
+    gene_2 <- genes_comb[idx, 2]
+
+    # Find cell IDs for cells with dropout
+    dropout_id_1 <- row.names(data_rna[(data_rna[gene_1] == 0.0), ])
+    dropout_id_2 <- row.names(data_rna[(data_rna[gene_2] == 0.0), ])
+    dropout_id_3 <- row.names(data_rna[((data_rna[gene_1] == 0.0) & (data_rna[gene_2] == 0.0)), ])
+
+    # Add dropout labels for plotting purposes
+    data_rna$dropout <- NA
+    data_rna[dropout_id_1, "dropout"]  <- gene_1
+    data_rna[dropout_id_2, "dropout"]  <- gene_2
+    data_rna[dropout_id_3, "dropout"]  <- "both"
+
+    p <- ggplot(data_rna, aes(x=get(gene_1), y=get(gene_2), color=dropout)) +
+            geom_point() +
+            theme_classic() +
+            labs(x=gene_1, y=gene_2) +
+            NoLegend() +
+            ggtitle(paste(gene_1, "vs", gene_2))
+    plot_list[[idx]] <- ggplotGrob(p)
+}
+
+grid.arrange(grobs=plot_list, ncol=5)
+```
+
+# Taking a subset of surfaceome gene
+
+For faster computation time only using surfaceome genes based upon average expression and number of cells expressed in.
+
+```{r}
+surfaceome_genes <- c(surfaceome_genes_all, genes)
+
+# Get RNA expression counts
+data_rna <- FetchData(seurat[["RNA"]], vars=surfaceome_genes)
+
+# Number of cells a gene is expressed in
+# Average expression of a gene
+num_cells <- colSums(data_rna > 0)
+avg_expression <- colMeans(data_rna)
+
+# Put into one dataframe
+df_genes <- data.frame(num_cells, avg_expression)
+df_genes$gene <- row.names(df_genes)
+df_genes <- df_genes %>% arrange(desc(avg_expression), desc(num_cells))
+
+# Manually remove B2M because it is an outlier that skews the data
+surfaceome_genes <- surfaceome_genes[surfaceome_genes != "B2M"]
+
+# Select top and bottom genes based on expression and ncells
+df_genes$use <- FALSE
+df_genes[head(df_genes, 50)$gene, "use"] <- TRUE
+df_genes[tail(df_genes, 50)$gene, "use"] <- TRUE
+df_genes[genes, "use"] <- TRUE
+
+# Subset surfaceome genes
+surfaceome_genes <- df_genes[df_genes$use, "gene"]
+
+ggplot(df_genes, aes(x=num_cells, y=avg_expression, color=use)) +
+    geom_point() +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    theme_classic() +
+    NoLegend()
+```
+
+# Normalization/Imputation
+
+
+## Log normalization (rna)
+
+```{r}
+# # RAW COUNTS
+# raw_rna <- FetchData(seurat[["RNA"]], vars=surfaceome_genes, layer="count")
+
+# # LOG NORMALIZATION
+# data_rna <- FetchData(seurat[["RNA"]], vars=surfaceome_genes, layer="data")
+```
+
+## SCT
+```{r}
+# # Re-run SCT 
+# seurat <- seurat[surfaceome_genes, ]
+# seurat <- SCTransform(seurat, return.only.var.genes=FALSE, verbose=T)
+
+# # SCT
+# data_sct <- FetchData(seurat[["SCT"]], vars=surfaceome_genes, layer="data")
+```
+
+## MAGIC
+```{r}
+# # MAGIC
+# # Load conda environment
+# myenvs <- reticulate::conda_list()
+# envname <- myenvs$name[3]
+# reticulate::use_condaenv(envname, required = TRUE)
+# library(Rmagic)
+# data_magic <- magic(raw_rna)$result
+```
+
+## SAVER
+```{r}
+# # SAVER
+# # Generate SAVER predictions for those genes
+# data_saver <- saver(t(raw_rna), estimates.only = TRUE, ncores=8)
+# data_saver <- data.frame(t(data_saver))
+```
+
+## Store output
+
+```{r}
+# # Put all matrices in a list for easy access
+# data_list <- list(data_rna, data_sct, data_magic, data_saver)
+# names(data_list) <- c("rna", "sct", "magic", "saver")
+
+# saveRDS(data_list, glue("{path_outs}/data_list.RDS"))
+
+data_list <- readRDS(glue("{path_outs}/data_list.RDS"))
+```
+
+# Compare average gene expression
+
+## All genes
+```{r}
+surfaceome_genes <- surfaceome_genes[!(surfaceome_genes %in% c("B2M", "EEF1A1"))]
+methods <- c("rna", "sct", "magic", "saver")
+
+df_avg <- data.frame(gene=surfaceome_genes)
+
+for (method in methods) {
+    data <- data_list[[method]]
+    avg <- data.frame(colSums(data) / dim(data)[1])
+    colnames(avg) <- method
+    avg$gene <- row.names(avg)
+
+   df_avg <-  merge(df_avg, avg, by="gene")
+}
+
+pheatmap(df_avg %>% column_to_rownames(var="gene"), scale="column", 
+            cluster_col=TRUE, cluster_row=TRUE, show_rownames=FALSE)
+```
+
+
+## Marker genes
+
+```{r}
+plot_exp <- function(gene_1, gene_2) {
+
+    plot_list <- list()
+    methods <- c("rna", "sct", "magic", "saver")
+
+    data <- data_list[["rna"]][c(gene_1, gene_2)]
+    dropout_id_1 <- row.names(data[(data[gene_1] == 0.0), ])
+    dropout_id_2 <- row.names(data[(data[gene_2] == 0.0), ])
+    dropout_id_3 <- row.names(data[((data[gene_2] == 0.0) & (data[gene_1] == 0.0)), ])
+
+    for (method in methods) {
+        data <- data_list[[method]]
+
+        data$dropout <- NA
+        data[dropout_id_1, "dropout"]  <- gene_1
+        data[dropout_id_2, "dropout"]  <- gene_2
+        data[dropout_id_3, "dropout"]  <- "both"
+
+        corr_method <- round(corr_list[[method]][gene_1, gene_2], 3)
+        p_corr_method <- round(p_corr_list[[method]][gene_1, gene_2], 3)
+
+        corr_cscore <- round(corr_list[["cscore"]][gene_1, gene_2], 3)
+        p_corr_cscore <- round(p_corr_list[["cscore"]][gene_1, gene_2], 3)
+        title <- glue("{method}: correlation = {corr_method}, pval={p_corr_method}\ncscore: correlation = {corr_cscore}, pval={p_corr_cscore}")
+   
+
+        p <- ggplot(data, aes(x=get(gene_1), y=get(gene_2), color=dropout)) +
+                geom_point() +
+                theme_classic() +
+                xlab(gene_1) + ylab(gene_2) +
+                ggtitle(title) +
+                NoLegend()
+                
+        plot_list[[method]] <- p
+    }
+
+    p <- cowplot::plot_grid(plotlist=plot_list, ncol=2)
+    return(p)
+}
+```
+
+```{r}
+df <- df_avg %>% subset(gene %in% genes)  %>% remove_rownames() %>% column_to_rownames(var="gene") 
+pheatmap(df, scale="column", annotation_row=genes_label, annotation_colors=anno_colors,
+            cluster_col=TRUE, cluster_row=TRUE)
+```
+
+
+# Correlation
+
+## Spearman correlation
+
+```{r}
+run_spearman <- function(data_list, surfaceome_genes) {
+
+    # Compute spearman correlation for each method (except CS-CORE)
+    methods <- c("rna", "sct", "magic", "saver")
+    p_corr_list <- list()
+    corr_list <- list()
+
+    # Unique combination of each surfaceome gene pair
+    genes_comb <- data.frame(t(combn(surfaceome_genes, 2)))
+
+    for (method in methods) {
+        data <- data_list[[method]]
+
+        gene_1_method <- c()
+        gene_2_method <- c()
+        corr_method <- c()
+        p_method <- c()
+
+        for (idx in 1:nrow(genes_comb)) {
+
+            gene_1 <- genes_comb[idx, 1]
+            gene_2 <- genes_comb[idx, 2]
+
+            gene_1_method <- c(gene_1_method, gene_1)
+            gene_2_method <- c(gene_2_method, gene_2)
+
+            gene_1_exp <- data[[gene_1]]
+            gene_2_exp <- data[[gene_2]]
+
+            if ((length(gene_1_exp) == 0) | (length(gene_2_exp) == 0 | all(gene_1_exp == 0) | all(gene_2_exp == 0))) {
+                # If a gene has no expression, set correlation = 0 and p-value = 1
+                corr_val <- 0.0
+                p_val <- 1.0
+            } else {
+                # Calculate spearman correlation and p-value otherwise
+                tmp <- cor.test(gene_1_exp, gene_2_exp, method="spearman", exact=F)
+                corr_val <- as.numeric(unname(tmp$estimate))
+                p_val <- as.numeric(tmp$p.value)
+            }
+
+            corr_method <- c(corr_method, corr_val)
+            p_method <- c(p_method, p_val)
+
+        }
+
+        # Data wrangling to put into matrix format
+        corr <- data.frame(Var1=gene_1_method, Var2=gene_2_method, value=corr_method)
+        corr_cp <- corr %>% rename(Var1=Var2, Var2=Var1)
+        corr_cp <- corr_cp[c("Var1", "Var2", "value")]
+        corr <- rbind(corr, corr_cp)
+        corr <- reshape2::dcast(corr, Var2 ~ Var1)
+        rownames(corr) <- corr$Var2
+        corr <- subset(corr, select = -c(Var2))
+
+        p_corr <- data.frame(Var1=gene_1_method, Var2=gene_2_method, value=p_method)
+        p_corr_cp <- p_corr %>% rename(Var1=Var2, Var2=Var1)
+        p_corr_cp <- p_corr_cp[c("Var1", "Var2", "value")]
+        p_corr <- rbind(p_corr, p_corr_cp)
+        p_corr <- reshape2::dcast(p_corr, Var2 ~ Var1)
+        rownames(p_corr) <- p_corr$Var2
+        p_corr <- subset(p_corr, select = -c(Var2))
+
+
+
+        # Set the diagonal values
+        # Correlation = 1, p-value = 1
+        corr <- as.matrix(corr)
+        diag(corr) <- 1
+
+        p_corr <- as.matrix(p_corr)
+        diag(p_corr) <- 1
+
+        # Store results
+        p_corr_list[[method]] <- p_corr
+        corr_list[[method]] <- corr
+
+    }
+
+    results <- list()
+    results[["corr"]] <- corr_list
+    results[["p_val"]] <- p_corr_list
+
+    return(results)
+
+}
+```
+
+```{r}
+# spearman_res <- run_spearman(data_list, surfaceome_genes)
+# saveRDS(spearman_res, glue("{path_outs}/spearman_res.RDS"))
+
+spearman_res <- readRDS(glue("{path_outs}/spearman_res.RDS"))
+p_corr_list <- spearman_res[["p_val"]]
+corr_list <- spearman_res[["corr"]]
+
+```
+
+## CS-CORE
+
+```{r}
+# Run CS-CORE
+CSCORE_result <- CSCORE(seurat, genes = surfaceome_genes)
+
+corr_list[["cscore"]] <- CSCORE_result$est
+p_corr_list[["cscore"]] <- CSCORE_result$p_value
+```
+
+# BH adjusted matrix
+
+```{r}
+# Soft threshold parameters for WGCNA
+power_list <- list()
+power_list[["rna"]] <- 2
+power_list[["sct"]] <- 1
+power_list[["magic"]] <- 1
+power_list[["saver"]] <- 4
+power_list[["cscore"]] <- 1
+
+
+run_wgcna <- function(mtx_coex, mtx_pval, genes, power) {
+  # Obtain BH-adjusted p values
+  p_matrix_BH <- matrix(0, length(genes), length(genes))
+  p_matrix_BH[upper.tri(p_matrix_BH)] <- p.adjust(mtx_pval[upper.tri(mtx_pval)], method = "BH")
+  p_matrix_BH <- p_matrix_BH + t(p_matrix_BH)
+
+  # Set co-expression entires with BH-adjusted p-values greater than 0.05 to 0
+  mtx_coex[p_matrix_BH > 0.05] <- 0
+
+  adj <- WGCNA::adjacency.fromSimilarity(abs(mtx_coex), power = power)
+
+  # Compute the topological overlap matrix
+  TOM <- WGCNA::TOMsimilarity(adj)
+  dissTOM <- 1 - TOM
+  rownames(dissTOM) <- colnames(dissTOM) <- genes
+  # Run hierarchical clustering as in the WGCNA workflow
+  hclust_dist <- hclust(as.dist(dissTOM), method = "average") 
+  memb <- dynamicTreeCut::cutreeDynamic(dendro = hclust_dist, 
+                      distM = dissTOM, 
+                      deepSplit = 2,
+                      pamRespectsDendro = FALSE,
+                      minClusterSize = 20)
+
+  # For more instructions on how to tune the parameters in the WGCNA workflow,
+  # please refer to https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/
+
+  names(memb) <- genes
+  memb_tab <- table(memb)
+  module_list <- lapply(sort(unique(memb)), function(i_k) names(which(memb == i_k)))
+
+  module_df <- data.frame(memb)
+  module_df$memb <- as.character(module_df$memb)
+  df <- module_df
+  df <- tibble::rownames_to_column(df, "gene")
+  colnames(df) <- c("gene", "module")
+
+  # Return both the modules and BH-adjust matrix
+  results <- list()
+  results[["wgcna"]] <- df
+  results[["bh_mtx"]] <- mtx_coex
+
+  return(results)
+}
+```
+
+```{r}
+wgcna_list <- list()
+bh_mtx_list <- list()
+
+for (method in names(corr_list)) {
+    corr <- corr_list[[method]]
+    p_corr <- p_corr_list[[method]]
+    power <- power_list[[method]]
+
+    # Run WGCNA
+    results <- run_wgcna(corr, p_corr, surfaceome_genes, power=power)
+    wgcna_list[[method]] <- results$wgcna
+    bh_mtx_list[[method]] <- results$bh_mtx
+}
+```
+
+## MAGIC
+
+### Raw spearman correlation results
+
+```{r}
+pheatmap(corr_list[["magic"]], show_rownames=FALSE, show_colnames=FALSE)
+```
+
+### Setting non-sig pairs to be 0 (BH adjusted matrix)
+
+```{r}
+pheatmap(bh_mtx_list[["magic"]], show_rownames=FALSE, show_colnames=FALSE)
+```
+
+### Marker genes
+```{r}
+pheatmap(bh_mtx_list[["magic"]][genes, genes], annotation_row=genes_label, annotation_colors=anno_colors, annotation_col=genes_label)
+```
+
+## SAVER
+
+### Raw spearman correlation results
+
+```{r}
+pheatmap(corr_list[["saver"]], show_rownames=FALSE, show_colnames=FALSE)
+```
+
+### Setting non-sig pairs to be 0 (BH adjusted matrix)
+
+```{r}
+pheatmap(bh_mtx_list[["saver"]], show_rownames=FALSE, show_colnames=FALSE)
+```
+
+
+### Marker genes
+```{r}
+pheatmap(bh_mtx_list[["saver"]][genes, genes], annotation_row=genes_label, annotation_colors=anno_colors, annotation_col=genes_label)
+```
+
+
+## cscore
+
+### Raw spearman correlation results
+
+```{r}
+pheatmap(corr_list[["cscore"]], show_rownames=FALSE, show_colnames=FALSE)
+```
+
+### Setting non-sig pairs to be 0 (BH adjusted matrix)
+
+```{r}
+pheatmap(bh_mtx_list[["cscore"]], show_rownames=FALSE, show_colnames=FALSE)
+```
+
+### Marker genes
+```{r}
+pheatmap(bh_mtx_list[["cscore"]][genes, genes], annotation_row=genes_label, annotation_colors=anno_colors, annotation_col=genes_label)
+```
+
+
+## Before filtering
+
+First trying to select good filtration parameters.
+
+```{r}
+# For each method, calculate the average expression for each gene
+comp_avg <- data.frame(gene=surfaceome_genes) 
+for (method in names(data_list)) {
+    df <- data_list[[method]]
+    df <- data.frame(colMeans(df))
+    colnames(df) <- c(method)
+    row.names(df) <- str_replace(row.names(df), "\\.", "-")
+
+    df$gene <- rownames(df)
+    comp_avg <- merge(comp_avg, df)
+}
+comp_avg <- comp_avg %>% column_to_rownames(var="gene")
+
+comp_n_cells <- data.frame(colSums(data_list[["rna"]] > 0))
+colnames(comp_n_cells) <- "rna"
+
+summary(comp_avg)
+```
+
+
+```{r}
+min_exp <- 0.2
+min_cells <- 40
+min_perc <- 0.2
+
+n_cells <- dim(data_list[["rna"]])[1]
+if (min_perc * n_cells < 30) {
+    min_perc <- 30 / n_cells
+}
+```
+
+Histogram of the average expression for each gene.
+
+```{r}
+methods <- c("rna", "sct", "magic", "saver")
+palette <- hue_pal()(length(methods))
+
+plot_list <- list()
+for (idx in 1:4) {
+    method <- methods[idx]
+    color <- palette[idx]
+
+    p <- ggplot(comp_avg) +
+        geom_histogram(aes(x=get(method)), fill=color, bins=50, alpha=0.5) +
+        theme_classic() +
+        labs(x="Average expression") +
+        ggtitle(method) +
+        geom_vline(xintercept = min_exp, color="black", size=1.5, linetype="dashed")
+
+    plot_list[[idx]] <- p
+
+}
+
+cowplot::plot_grid(plotlist=plot_list, ncol=2)
+```
+
+Histogram of the number of cells each gene is expressed in based upon the log-normalized expression.
+
+```{r}
+ggplot(comp_n_cells) +
+    geom_histogram(aes(x=rna), bins=50, alpha=0.5, color="black", fill=palette[1]) +
+    theme_classic() +
+    labs(x="Number of cells") +
+    ggtitle("RNA number of cells") +
+   geom_vline(xintercept = min_cells, color="black", size=1.5, linetype="dashed")
+```
+
+Histogram of the percentage of cells each gene is expressed in based upon the log-normalized expression (rna).
+
+
+```{r}
+comp_perc_cells <- comp_n_cells / n_cells
+
+ggplot(comp_perc_cells) +
+    geom_histogram(aes(x=rna), bins=50, alpha=0.5, color="black", fill=palette[1]) +
+    theme_classic() +
+    labs(x="Percentage of cells") +
+    ggtitle("RNA percentage of cells") +
+    geom_vline(xintercept = min_perc, color="black", size=1.5, linetype="dashed")
+```
+
+Now I compare each method against one another by plotting the correlation scores for each gene pair. Any pairs that would be filtered by the thresholds (listed below) are highlighted in red on the scatterplots. Only one gene in the pair needs to fail this metric to be filtered out.
+
+
+- average expression < `r min_exp`
+- number of cells expressed in > `r min_cells`
+- percentag of cells expressed in > `r min_perc`
+
+
+For CS-CORE which does not provide a count matrix, I am using the values from whichever method it is being compared against (RNA, SCT, MAGIC, SAVER).
+
+```{r}
+# Co-expression/correlation scores for each method
+comp_corr <- reshape2::melt(bh_mtx_list[["rna"]]) %>% rename(rna=value)
+for (method in c("sct", "magic", "saver", "cscore")) {
+    df <- bh_mtx_list[[method]]
+    df <- reshape2::melt(df)
+    colnames(df) <- c("Var1", "Var2", method)
+
+    comp_corr <- merge(comp_corr, df)
+}
+
+final_pairs <- comp_corr
+final_pairs <- final_pairs %>% subset(Var1 != Var2)
+
+# Get genes filtered by min cells
+filter_genes <- comp_n_cells %>% subset(rna < min_cells)
+filter_genes <- rownames(filter_genes)
+
+final_pairs <- final_pairs %>% mutate(filter = ((Var1 %in% filter_genes) | (Var2 %in% filter_genes)))
+```
+
+
+```{r fig.height=12.5, fig.width=12.5}
+methods <- names(bh_mtx_list)
+plot_list <- list()
+idx <- 1
+
+for (method_1 in methods) {
+    for (method_2 in methods) {
+
+        if (method_1 == "cscore") {comp_avg$cscore = comp_avg[[method_2]]}
+        if (method_2 == "cscore") {comp_avg$cscore = comp_avg[[method_1]]}
+        
+        # Genes to filter by min expression
+        tmp <- comp_avg %>% subset((get(method_1) < min_exp) & (get(method_2) < min_exp))
+        filter_genes <- row.names(tmp)
+
+        df <- final_pairs
+        df[(df$Var1 %in% filter_genes) | (df$Var2 %in% filter_genes), "filter"] <- TRUE
+        df <- df %>% arrange(filter)
+
+        p <- ggplot(df) +
+            geom_point(aes(x=df[[method_1]], y=df[[method_2]], color=df[["filter"]])) +
+            scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+            theme_classic() +
+            NoLegend() +
+            labs(x=method_1, y=method_2) +
+            ggtitle(paste(method_1, "vs", method_2)) +
+            ylim(-1, 1) +
+            xlim(-1, 1)
+
+
+        plot_list[[idx]] <- ggplotGrob(p)
+
+        idx <- idx + 1
+    }
+}
+grid.arrange(grobs=plot_list, ncol=5)
+```
+
+## After filtration
+
+```{r fig.height=12.5, fig.width=12.5}
+methods <- names(bh_mtx_list)
+plot_list <- list()
+idx <- 1
+
+for (method_1 in methods) {
+    for (method_2 in methods) {
+
+        if (method_1 == "cscore") {comp_avg$cscore = comp_avg[[method_2]]}
+        if (method_2 == "cscore") {comp_avg$cscore = comp_avg[[method_1]]}
+        
+        # Genes to filter by min expression
+        tmp <- comp_avg %>% subset((get(method_1) < min_exp) & (get(method_2) < min_exp))
+        filter_genes <- row.names(tmp)
+
+        df <- final_pairs
+        df[(df$Var1 %in% filter_genes) | (df$Var2 %in% filter_genes), "filter"] <- TRUE
+        df <- df %>% arrange(filter)
+
+        df <- df %>% subset(filter == FALSE)
+
+        p <- ggplot(df) +
+            geom_point(aes(x=df[[method_1]], y=df[[method_2]], color=df[["filter"]])) +
+            scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+            theme_classic() +
+            NoLegend() +
+            labs(x=method_1, y=method_2) +
+            ggtitle(paste(method_1, "vs", method_2)) +
+            ylim(-1, 1) +
+            xlim(-1, 1) +
+            geom_abline(slope=1, intercept=0, color="red")
+
+
+        plot_list[[idx]] <- ggplotGrob(p)
+
+        idx <- idx + 1
+    }
+}
+grid.arrange(grobs=plot_list, ncol=5)
+```
+
+# Comparing specific methods
+
+## MAGIC
+
+Magic tends to always give high correlation scores
+
+
+### vs saver
+```{r}
+method_1 <- "saver"
+method_2 <- "magic"
+
+if (method_1 == "cscore") {comp_avg$cscore = comp_avg[[method_2]]}
+if (method_2 == "cscore") {comp_avg$cscore = comp_avg[[method_1]]}
+
+# Genes to filter by min expression
+tmp <- comp_avg %>% subset((get(method_1) < min_exp) & (get(method_2) < min_exp))
+filter_genes <- row.names(tmp)
+
+df <- final_pairs
+df[(df$Var1 %in% filter_genes) | (df$Var2 %in% filter_genes), "filter"] <- TRUE
+df <- df %>% arrange(filter)
+
+df <- df %>% subset(filter == FALSE)
+
+p <- ggplot(df) +
+    geom_point(aes(x=get(method_1), y=get(method_2), color=filter)) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    theme_classic() +
+    NoLegend() +
+    labs(x=method_1, y=method_2) +
+    ggtitle(paste(method_1, "vs", method_2)) +
+    ylim(-1, 1) +
+    xlim(-1, 1) +
+    geom_abline(slope=1, intercept=0, color="red")
+p
+```
+
+### vs cscore
+
+```{r}
+method_1 <- "cscore"
+method_2 <- "magic"
+
+if (method_1 == "cscore") {comp_avg$cscore = comp_avg[[method_2]]}
+if (method_2 == "cscore") {comp_avg$cscore = comp_avg[[method_1]]}
+
+# Genes to filter by min expression
+tmp <- comp_avg %>% subset((get(method_1) < min_exp) & (get(method_2) < min_exp))
+filter_genes <- row.names(tmp)
+
+df <- final_pairs
+df[(df$Var1 %in% filter_genes) | (df$Var2 %in% filter_genes), "filter"] <- TRUE
+df <- df %>% arrange(filter)
+
+df <- df %>% subset(filter == FALSE)
+
+p <- ggplot(df) +
+    geom_point(aes(x=get(method_1), y=get(method_2), color=filter)) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    theme_classic() +
+    NoLegend() +
+    labs(x=method_1, y=method_2) +
+    ggtitle(paste(method_1, "vs", method_2)) +
+    ylim(-1, 1) +
+    xlim(-1, 1) +
+    geom_abline(slope=1, intercept=0, color="red")
+p
+```
+
+## CS-CORE vs SAVER
+
+Tend to agree, but there are exceptions
+
+```{r}
+method_1 <- "cscore"
+method_2 <- "saver"
+
+if (method_1 == "cscore") {comp_avg$cscore = comp_avg[[method_2]]}
+if (method_2 == "cscore") {comp_avg$cscore = comp_avg[[method_1]]}
+
+# Genes to filter by min expression
+tmp <- comp_avg %>% subset((get(method_1) < min_exp) & (get(method_2) < min_exp))
+filter_genes <- row.names(tmp)
+
+df <- final_pairs
+df[(df$Var1 %in% filter_genes) | (df$Var2 %in% filter_genes), "filter"] <- TRUE
+df <- df %>% arrange(filter)
+
+df <- df %>% subset(filter == FALSE)
+
+p <- ggplot(df) +
+    geom_point(aes(x=get(method_1), y=get(method_2), color=filter)) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    theme_classic() +
+    NoLegend() +
+    labs(x=method_1, y=method_2) +
+    ggtitle(paste(method_1, "vs", method_2)) +
+    ylim(-1, 1) +
+    xlim(-1, 1) +
+    geom_abline(slope=1, intercept=0, color="red")
+p
+```
+
+# Why do cscore and saver disagree?
+
+## Differences in significance
+
+recall we set correlations to 0 when the gene pairs are not significant
+
+if we undo this, the relationship looks like this:
+
+```{r}
+comp_corr <- reshape2::melt(corr_list[["rna"]]) %>% rename(rna=value)
+for (method in c("sct", "magic", "saver", "cscore")) {
+    df <- corr_list[[method]]
+    df <- reshape2::melt(df)
+    colnames(df) <- c("Var1", "Var2", method)
+
+    comp_corr <- merge(comp_corr, df)
+}
+
+method_1 <- "cscore"
+method_2 <- "saver"
+
+if (method_1 == "cscore") {comp_avg$cscore = comp_avg[[method_2]]}
+if (method_2 == "cscore") {comp_avg$cscore = comp_avg[[method_1]]}
+
+df <- comp_corr %>% subset(Var1 != Var2)
+# Get genes filtered by min cells
+filter_genes <- comp_n_cells %>% subset(rna < min_cells)
+filter_genes <- rownames(filter_genes)
+
+df <- df %>% mutate(filter = ((Var1 %in% filter_genes) | (Var2 %in% filter_genes)))
+
+
+# Genes to filter by min expression
+tmp <- comp_avg %>% subset((get(method_1) < min_exp) & (get(method_2) < min_exp))
+filter_genes <- row.names(tmp)
+
+df[(df$Var1 %in% filter_genes) | (df$Var2 %in% filter_genes), "filter"] <- TRUE
+df <- df %>% arrange(filter)
+
+df <- df %>% subset(filter == FALSE)
+```
+
+```{r}
+p <- ggplot(df) +
+    geom_point(aes(x=get(method_1), y=get(method_2), color=filter)) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    theme_classic() +
+    NoLegend() +
+    labs(x=method_1, y=method_2) +
+    ggtitle(paste(method_1, "vs", method_2)) +
+    ylim(-1, 1) +
+    xlim(-1, 1) +
+    geom_abline(slope=1, intercept=0, color="red")
+p
+```
+
+
+## Big differences in expression values of the genes
+
+Large changes in average expression of gene 1 and gene 2 - not considered significant
+
+```{r}
+gene_1 <- "CCL5"
+gene_2 <- "CD8A"
+
+comp_avg[c(gene_1, gene_2), , drop=FALSE]
+```
+
+```{r fig.height=8, fig.width=8}
+plot_exp(gene_1, gene_2)
+```
+
+
+# Only keep significant gene pairs where cscore and saver agree
+
+```{r}
+method_1 <- "cscore"
+method_2 <- "saver"
+
+if (method_1 == "cscore") {comp_avg$cscore = comp_avg[[method_2]]}
+if (method_2 == "cscore") {comp_avg$cscore = comp_avg[[method_1]]}
+
+# Genes to filter by min expression
+tmp <- comp_avg %>% subset((get(method_1) < min_exp) & (get(method_2) < min_exp))
+filter_genes <- row.names(tmp)
+
+df <- final_pairs
+df[(df$Var1 %in% filter_genes) | (df$Var2 %in% filter_genes), "filter"] <- TRUE
+df <- df %>% arrange(filter)
+
+df <- df %>% subset(filter == FALSE)
+
+p <- ggplot(df) +
+    geom_point(aes(x=get(method_1), y=get(method_2), color=filter)) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    theme_classic() +
+    NoLegend() +
+    labs(x=method_1, y=method_2) +
+    ggtitle(paste(method_1, "vs", method_2)) +
+    ylim(-1, 1) +
+    xlim(-1, 1) +
+    geom_abline(slope=1, intercept=0, color="red")
+p
+```
+
+
+Becomes 
+
+```{r}
+df <- df %>% subset(saver!=0 & cscore!=0)
+
+p <- ggplot(df) +
+    geom_point(aes(x=get(method_1), y=get(method_2), color=filter)) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    theme_classic() +
+    NoLegend() +
+    labs(x=method_1, y=method_2) +
+    ggtitle(paste(method_1, "vs", method_2)) +
+    ylim(-1, 1) +
+    xlim(-1, 1) +
+    geom_abline(slope=1, intercept=0, color="red")
+p
+```
+
+With the final table of genes like so:
+
+```{r}
+df <- df %>% arrange(desc(saver), desc(cscore))
+df <- df[!duplicated(cbind(t(apply(df[1:2], 1, sort)))), ]
+df
+```
+
+## Example
+
+Using the `gene_lookup()` function, we can supply the first gene pair listed to look at the summary information of the pair.
+
+```{r fig.height=8, fig.width=8}
+idx <- 1
+gene_1 <- as.character(df[idx, "Var1"])
+gene_2 <- as.character(df[idx, "Var2"])
+plot_exp(gene_1, gene_2)
+```
+
+
+```{r fig.height=8, fig.width=8}
+idx <- 1
+gene_1 <- "CCL5"
+gene_2 <- "CST7"
+plot_exp(gene_1, gene_2)
+```
