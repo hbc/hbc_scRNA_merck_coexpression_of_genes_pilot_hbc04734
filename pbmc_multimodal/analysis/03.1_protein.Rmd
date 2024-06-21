@@ -1,0 +1,850 @@
+---
+title: "Protein expression for pbmc_multimodal"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r}
+#' Create sub-chunks for plots
+#' Plotting function to generate plots of a specific dimension when html is knitted
+#'
+#' taken from: https://stackoverflow.com/questions/15365829/dynamic-height-and-width-for-knitr-plots
+#'
+#' @param pl a plot object
+#' @param fig.height figure height
+#' @param fig.width figure width
+#' @param chunk_name name of the chunk
+#'
+#' @author Andreas Scharmueller \email{andschar@@protonmail.com}
+#'
+subchunkify = function(pl,
+                       fig.height = 7,
+                       fig.width = 5,
+                       chunk_name = 'plot') {
+  pl_deparsed = paste0(deparse(function() {
+    pl
+  }), collapse = '')
+  
+  sub_chunk = paste0(
+    "```{r ",
+    chunk_name,
+    ", fig.height=",
+    fig.height,
+    ", fig.width=",
+    fig.width,
+    ", dpi=72",
+    ", echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}",
+    "\n(",
+    pl_deparsed,
+    ")()",
+    "\n```"
+  )
+  
+  cat(knitr::knit(
+    text = knitr::knit_expand(text = sub_chunk),
+    quiet = TRUE
+  ))
+}
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+library(CSCORE)
+library(WGCNA)
+library(ggpubr)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes: pbmc_multimodal"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+
+This is a sc-RNA-Seq data that James merged from individual sorted pbmc subset populations that he downloaded from here:
+https://www.10xgenomics.com/resources/datasets?query=&page=1&configure%5Bfacets%5D%5B0[…]s%5D%5B1%5D=pipeline.version&configure%5BhitsPerPage%5D=500
+
+A brief overview of what the dataset looks like:
+
+```{r}
+# Load dataset
+# remotes::install_github("mojaveazure/seurat-disk", quiet=F)
+library(SeuratDisk)
+seurat <- LoadH5Seurat("../data/pbmc_multimodal.h5seurat")
+```
+
+```{r}
+# This dataset only came with ADT and SCT assays
+# The raw counts were stored in the "counts" slot of the SCT assay
+# Creating another RNA assay with the raw counts as CSCORE requires it
+raw_rna <- GetAssayData(object =  seurat[['SCT']], layer = 'counts')
+seurat[["RNA"]] <- CreateAssayObject(counts = raw_rna )
+seurat <- NormalizeData(seurat, assay="RNA")
+```
+
+```{r fig.height=6}
+seurat$celltype <- seurat$celltype.l1
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = celltype,
+            fill=celltype),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle(glue("{name_project}\nCelltypes")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = celltype, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+```{r fig.height=5, fig.width=7}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nCelltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+
+# CD4 T Cells
+
+As a first pass, I wanted to look at the protein expression of both CD45 and CD4 as they should both be highly expressed in these CD4 T cells.
+
+# Protein ADT expression
+
+Within this dataset there are several instances where protein have multiple version "-1" and "-2". Here is the list of proteins that I am making use of:
+
+```{r}
+seurat_ct <- subset(seurat, subset=(celltype == "CD4 T"))
+```
+
+```{r}
+# Figure out which proteins to use
+genes_adt <- sort(row.names(seurat_ct[["ADT"]]))
+# genes_adt[startsWith(genes_adt, "CD95")]
+genes <- c("CD4-1", "CD4-2", "CD45-1", "CD45-2", "CD2", "CD3-1", "CD3-2", "CD28", "CD95")
+
+genes
+```
+
+Here I am comparing the normalized protein expression after applying a log10 transormation. All of these genes are surface proteins we would expect to find on CD4 T cells so we should expect to see some degree of good correlation between pairs. I've taken a somewhat random sample of pairs and plotted the expression below:
+
+```{r}
+counts_adt <- FetchData(seurat_ct[["ADT"]], vars=genes)
+
+# Log scale the data
+counts_adt <- log10(counts_adt + 0.01) - log10(0.01)
+```
+
+## CD4-1 vs CD45-1
+```{r}
+gene_1 <- "CD4-1"
+gene_2 <- "CD45-1"
+
+scatter <- ggplot(counts_adt) +
+    geom_point(aes(x=get(gene_1), y=get(gene_2))) +
+    theme_classic() + 
+    xlab(glue("log10(Protein {gene_1})")) +
+    ylab(glue("log10(Protein {gene_2})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=get(gene_1), y=get(gene_2)), method = "pearson", color="blue")
+ 
+density <- ggplot(counts_adt) +
+    geom_bin2d(aes(x=get(gene_1), y=get(gene_2)), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(Protein {gene_1})")) +
+    ylab(glue("log10(Protein {gene_2})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD4-2 vs CD45-2
+```{r}
+gene_1 <- "CD4-2"
+gene_2 <- "CD45-2"
+
+scatter <- ggplot(counts_adt) +
+    geom_point(aes(x=get(gene_1), y=get(gene_2))) +
+    theme_classic() + 
+    xlab(glue("log10(Protein {gene_1})")) +
+    ylab(glue("log10(Protein {gene_2})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=get(gene_1), y=get(gene_2)), method = "pearson", color="blue")
+ 
+density <- ggplot(counts_adt) +
+    geom_bin2d(aes(x=get(gene_1), y=get(gene_2)), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(Protein {gene_1})")) +
+    ylab(glue("log10(Protein {gene_2})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD4-2 vs CD2
+```{r}
+gene_1 <- "CD4-2"
+gene_2 <- "CD2"
+
+scatter <- ggplot(counts_adt) +
+    geom_point(aes(x=get(gene_1), y=get(gene_2))) +
+    theme_classic() + 
+    xlab(glue("log10(Protein {gene_1})")) +
+    ylab(glue("log10(Protein {gene_2})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=get(gene_1), y=get(gene_2)), method = "pearson", color="blue")
+ 
+density <- ggplot(counts_adt) +
+    geom_bin2d(aes(x=get(gene_1), y=get(gene_2)), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(Protein {gene_1})")) +
+    ylab(glue("log10(Protein {gene_2})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD4-2 vs CD28
+```{r}
+gene_1 <- "CD4-2"
+gene_2 <- "CD28"
+
+scatter <- ggplot(counts_adt) +
+    geom_point(aes(x=get(gene_1), y=get(gene_2))) +
+    theme_classic() + 
+    xlab(glue("log10(Protein {gene_1})")) +
+    ylab(glue("log10(Protein {gene_2})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=get(gene_1), y=get(gene_2)), method = "pearson", color="blue")
+ 
+density <- ggplot(counts_adt) +
+    geom_bin2d(aes(x=get(gene_1), y=get(gene_2)), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(Protein {gene_1})")) +
+    ylab(glue("log10(Protein {gene_2})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+# RNA vs Protein
+
+Now we want to compare the RNA against the protein expression. This should give us some measure of how much dropout we are experiencing from the scRNA experimental perspective. 
+```{r}
+# Getting counts for RNA genes associated with the ADT counts
+genes_rna <- row.names(seurat_ct[["RNA"]])
+# genes_rna[startsWith(genes_rna, "FAS")]
+
+genes <- c("CD4", "PTPRC", "CD2", "CD3E", "CD3G", "CD3D", "CD28", "FAS")
+counts_rna <- FetchData(seurat_ct[["RNA"]], vars=genes)
+
+# Log scale the data
+counts_rna <- log10(counts_rna + 0.01) - log10(0.01)
+```
+
+## CD45
+```{r}
+gene <- "PTPRC"
+protein <- "CD45-2"
+
+scatter <- ggplot() +
+    geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]])) +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD4
+```{r}
+gene <- "CD4"
+protein <- "CD4-2"
+
+scatter <- ggplot() +
+    geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]])) +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD2
+```{r}
+gene <- "CD2"
+protein <- "CD2"
+
+scatter <- ggplot() +
+    geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]])) +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD3E, CD3D, CD3G (CD3)
+
+### CD3E
+```{r}
+gene <- "CD3E"
+protein <- "CD3-1"
+
+scatter <- ggplot() +
+    geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]])) +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+### CD3D
+```{r}
+gene <- "CD3D"
+protein <- "CD3-1"
+
+scatter <- ggplot() +
+    geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]])) +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+
+### CD3G
+```{r}
+gene <- "CD3G"
+protein <- "CD3-1"
+
+scatter <- ggplot() +
+    geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]])) +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+
+## CD28
+```{r}
+gene <- "CD28"
+protein <- "CD28"
+
+scatter <- ggplot() +
+    geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]])) +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD95 (FAS)
+```{r}
+gene <- "FAS"
+protein <- "CD95"
+
+scatter <- ggplot() +
+    geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]])) +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+
+# Notes
+
+We can see more clearly the amount of dropout that we are contending with in these scatterplots. There are thousands of cells that will have 0 expression for the gene while at the same time exhibiting relatively high protein expression from the ADT data. This is the first step to evaluating how much drop-out we are actually contending with and if imputation could potentially be a solution to the problem (which will be investigated later in this report).
+
+# CS-CORE correlation 
+
+Recall that CS-CORE takes in the raw counts values for its calculations and provides us with co-expression estimates and p-values for each pair of genes specified. 
+
+```{r}
+genes <- c("CD4", "PTPRC", "CD2", "CD3E", "CD3G", "CD3D", "CD28", "FAS")
+CSCORE_result <- CSCORE(seurat_ct, genes = genes)
+
+# Get the p-value, co-expression estimate, and test statistic from CS-CORE
+df <- reshape2::melt(CSCORE_result$p_value) %>% rename(p_value=value)
+df$est <- reshape2::melt(CSCORE_result$est)$value
+df$test_stat <- reshape2::melt(CSCORE_result$test_stat)$value
+
+df
+```
+
+This is a heatmap of the co-expression values within the set of genes that we are working with.
+
+```{r}
+p <- pheatmap(CSCORE_result$est, show_colnames = TRUE, show_rownames = TRUE, silent=TRUE)
+p
+```
+
+# Notes
+
+You can see that these correlation values are quite low despite the fact that almost all of the pairs are significant. This is the point where we can test out several different strategies of establishing which correlations we trust.
+
+# Imputation
+
+Here we are imputing using the MAGIC algorithm on the seurat normalized expression matrix to see how well it compares against the original RNA and protein expression. Here we have plotted both of them to help evaluate if imputation introduces more noise in the data as we can use the protein expression as a ground truth value.
+
+```{r}
+genes <- c("CD4", "PTPRC", "CD2", "CD3E", "CD3G", "CD3D", "CD28", "FAS")
+
+# Load conda environment
+myenvs <- reticulate::conda_list()
+envname <- myenvs$name[3]
+reticulate::use_condaenv(envname, required = TRUE)
+
+library(Rmagic)
+
+data <- seurat_ct[genes]
+data <- data@assays$RNA@data
+data <- t(data.frame(data))
+data_magic <- magic(data, genes=genes)
+counts_magic <- data_magic$result
+
+counts_magic <- log10(counts_magic + 0.01) - log10(0.01)
+```
+
+## CD45
+```{r}
+gene <- "PTPRC"
+protein <- "CD45-2"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "pearson", color="blue")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD4
+```{r}
+gene <- "CD4"
+protein <- "CD4-2"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "pearson", color="blue")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD2
+```{r}
+gene <- "CD2"
+protein <- "CD2"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "pearson", color="blue")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD3E, CD3D, CD3G (CD3)
+
+### CD3E
+```{r}
+gene <- "CD3E"
+protein <- "CD3-1"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "pearson", color="blue")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+### CD3D
+```{r}
+gene <- "CD3D"
+protein <- "CD3-1"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "pearson", color="blue")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+
+### CD3G
+```{r}
+gene <- "CD3G"
+protein <- "CD3-1"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "pearson", color="blue")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+
+## CD28
+```{r}
+gene <- "CD28"
+protein <- "CD28"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "pearson", color="blue")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+## CD95 (FAS)
+```{r}
+gene <- "FAS"
+protein <- "CD95"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "pearson", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "pearson", color="blue")
+```
+
+```{r}
+gene <- "FAS"
+protein <- "CD95"
+
+scatter <- ggplot() +
+    geom_bin2d(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    xlab(glue("log10(RNA {gene})")) +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(x=counts_rna[[gene]], y=counts_magic[[gene]]), method = "spearman", color="blue")
+
+density <- ggplot() +
+    geom_bin2d(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), bins=100) +
+    scale_fill_continuous(type = "viridis") +
+    theme_classic() +
+    ylab(glue("log10(Imputed RNA {gene})")) +
+    xlab(glue("log10(Protein {protein})")) +
+    geom_abline(slope=1, intercept = 0, color="red") +
+    stat_cor(aes(y=counts_magic[[gene]], x=counts_adt[[protein]]), method = "spearman", color="blue")
+```
+
+```{r fig.width=10, fig.height=5}
+cowplot::plot_grid(scatter, density, ncol=2)
+```
+
+# Notes
+
+After running imputation, we can see the many cells that originally have 0 expression in a gene have increased expression. However, at the same time, it does not seem to gain as much expression as other cells in the dataset that originally expressed that gene. 
+
+# Next steps
+
+1. There is FACs sorted dataset we can do a smiliar analysis on to see if we get similar results.
+2. Instead of solely relying on the MAGIC implementation of imputation, we can also try using SAVER to see if perhaps it introduces less noise in the dataset.
+3. I want to take the full set of proteins that are in this dataset and see how many pairs I can make from the RNA data. This way we can compare more co-expression estimates against protein expression to see how much we trust the results. In doing so, we can try to estimate the false discovery rate of both CS-Core and MAGIC.
+4. Establish best metrics to help discover highly co-expressed pairs of genes without prior knowledge (% expressed in cells, gene pairs belonging to the same WGCNA module, etc).
+5. Negative controls
+5. Remove dropout and re-evaluate co-expression
+7 apr 19 ismb poster
+8. All celltypes
+9. -1 vs -2

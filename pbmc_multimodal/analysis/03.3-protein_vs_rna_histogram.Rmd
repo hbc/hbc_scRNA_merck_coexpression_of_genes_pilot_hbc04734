@@ -1,0 +1,363 @@
+---
+title: "Protein expression for pbmc_multimodal"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+# library(CSCORE)
+# library(WGCNA)
+library(ggpubr)
+library(ggvenn)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes: pbmc_multimodal"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+A brief overview of what the dataset looks like:
+
+```{r}
+# Load dataset
+# remotes::install_github("mojaveazure/seurat-disk", quiet=F)
+library(SeuratDisk)
+seurat <- LoadH5Seurat("../data/pbmc_multimodal.h5seurat")
+```
+
+```{r}
+# This dataset only came with ADT and SCT assays
+# The raw counts were stored in the "counts" slot of the SCT assay
+# Creating another RNA assay with the raw counts as CSCORE requires it
+raw_rna <- GetAssayData(object =  seurat[['SCT']], layer = 'counts')
+seurat[["RNA"]] <- CreateAssayObject(counts = raw_rna )
+seurat <- NormalizeData(seurat, assay="RNA")
+
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r fig.height=6}
+seurat$celltype <- seurat$celltype.l1
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = celltype,
+            fill=celltype),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle(glue("{name_project}\nCelltypes")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = celltype, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+```{r fig.height=5, fig.width=7}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nCelltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+# Protein -> RNA naming
+
+I am going to investigate the dropout rate more closely. 
+
+Since there are multiple different names for a gene, I am scraping the database for alternative names for the various proteins that were used in this dataset so we can look at as many instances of dropout as possible.
+
+I used the resources titled [Data from the Human Protein Atlas in tab-separated format](https://www.proteinatlas.org/about/download) from the Human Protein Atlas to get all possible naming conventions.
+
+```{r}
+genes_adt <- sort(row.names(seurat[["ADT"]]))
+genes_rna <- sort(row.names(seurat[["RNA"]]))
+```
+
+```{r}
+df <- read.csv("~/Downloads/proteinatlas.tsv", row.names=NULL, sep="\t")
+df <- df[c("Gene", "Gene.synonym")]
+
+list_gene <- c()
+list_syno <- c()
+
+for (idx in 1:nrow(df)) {
+    gene <- df[idx, "Gene"]
+    gene.synonym <- df[idx, "Gene.synonym"]
+    gene.synonym <- trimws(strsplit(gene.synonym, ",")[[1]])
+
+    for (g in gene.synonym) {
+        list_gene <- c(list_gene, gene)
+        list_syno <- c(list_syno, g)
+    }
+}
+
+df_gene <- data.frame(gene=list_gene, gene_syn=list_syno)
+df_gene <- df_gene %>% mutate(across(where(is.character), toupper))
+
+genes <- genes_adt[(genes_adt %in% df_gene$gene) | (genes_adt %in% df_gene$gene_syn)]
+
+list_protein <- c()
+list_rna <- c()
+for (protein in genes) {
+    df_protein <- df_gene[(df_gene$gene == protein) | (df_gene$gene_syn == protein),]
+    gene_names <- unlist(unname(as.list(df_protein)))
+
+    rna <- unique(gene_names[gene_names %in% genes_rna])
+    if (rlang::is_empty(rna) | length(rna) > 1) {
+        print(paste0(protein, " : ", rna))
+        next
+    }
+
+    list_protein <- c(list_protein, protein)
+    list_rna <- c(list_rna, rna)
+}
+
+
+df_genes <- data.frame(protein=list_protein, rna=list_rna) 
+df_genes
+```
+
+# RNA vs Protein expression
+
+Here I am applying a log10 tranformation to the normalized protein and RNA matrices for the genes that we are interested in.
+
+```{r}
+# Log scale the ADT counts
+counts_adt <- FetchData(seurat[["ADT"]], vars=df_genes$protein)
+counts_adt <- log10(counts_adt + 0.01) - log10(0.01)
+
+# Log scale the RNA normalized counts
+counts_rna <- FetchData(seurat[["RNA"]], vars=df_genes$rna)
+counts_rna <- log10(counts_rna + 0.01) - log10(0.01)
+
+# Celltype information for each cell
+celltype <- unname(seurat$celltype)
+counts_rna$celltype <- celltype
+counts_adt$celltype <- celltype
+```
+
+# Calculate: %dropout + correlation
+
+Here I am subsetting the cells by celltype. Then using the list of genes (shown above) I am computing the proportion of dropout (RNA expression == 0) as well as the pearson correlation coefficient when comparing RNA vs Protein expression.
+
+```{r}
+seurat$celltype <- seurat$celltype.l1
+celltypes <- sort(unique(seurat$celltype))
+
+list_dropout <- list()
+list_corr <- list()
+
+for (ct in celltypes) {
+    print(ct)
+
+    counts_adt_ct <- counts_adt[counts_adt$celltype == ct, ]
+    counts_rna_ct <- counts_rna[counts_rna$celltype == ct, ]
+
+    ct_dropout <- c()
+    ct_corr <- c()
+
+    for (idx in 1:nrow(df_genes)) {
+        protein <- df_genes[idx, "protein"]
+        gene <- df_genes[idx, "rna"]
+
+        pct_dropout <- sum(counts_rna_ct[gene] == 0.0) / dim(counts_rna_ct)[1]
+        ct_dropout <- c(ct_dropout, pct_dropout)
+
+        # Subset out 0 RNA expression
+        df <- data.frame(counts_rna_ct[[gene]], counts_adt_ct[[protein]])
+        colnames(df) <- c("RNA", "Protein")
+        df <- df[df$RNA != 0,]
+
+        correlation <- cor(counts_rna_ct[[gene]], counts_adt_ct[[protein]], method="pearson") %>% as.numeric
+        ct_corr <- c(ct_corr, correlation)
+    }
+
+    names(ct_dropout) <- df_genes$rna
+    names(ct_corr) <- df_genes$rna
+
+    list_dropout[[ct]] <- ct_dropout
+    list_corr[[ct]] <- ct_corr
+}
+
+df_dropout <- data.frame(list_dropout)
+df_corr <- data.frame(list_corr)
+```
+
+## % dropout
+
+Percentage of instances where a cell has RNA expression = 0 for a particular gene within a celltype.
+
+```{r}
+df_dropout
+```
+
+```{r}
+df_dropout_melt <- df_dropout %>%
+                    rownames_to_column("gene") %>%
+                    pivot_longer(cols = -gene, names_to = "celltype", values_to = 'pct_dropout')
+
+ggplot(df_dropout_melt, aes(pct_dropout)) +
+    geom_histogram(bins=50, alpha = 0.3, position = "identity", fill="pink", color="pink") +
+    theme_classic() +
+    xlab("% dropout (RNA expression == 0)") +
+    ggtitle("% dropout per celltype/gene")
+```
+
+## RNA vs protein correlation
+
+When computing these correlation values, I first subset the count matrix by celltype. Then, I removed the cells that had 0 expression for the corresponding gene in the RNA. I then computed the pearson correlation on the remaining values, comparing rna vs protein expression.
+
+```{r}
+df_corr
+```
+
+```{r}
+df_corr_melt <- df_corr %>%
+                    rownames_to_column("gene") %>%
+                    pivot_longer(cols = -gene, names_to = "celltype", values_to = 'corr')
+
+ggplot(df_corr_melt, aes(corr)) +
+    geom_histogram(bins=50, alpha = 0.3, position = "identity", fill="purple", color="purple") +
+    theme_classic() +
+    xlab("Pearson correlation coefficient") +
+    ggtitle("Pearson correlation: RNA vs protein")
+```
+
+
+## Dropout vs correlation
+
+```{r}
+df <- merge(df_corr_melt, df_dropout_melt, by=c("celltype", "gene"))
+
+df
+```
+
+```{r}
+ggplot(df, aes(x=corr, y=pct_dropout, color=celltype)) +
+    geom_point() +
+    theme_classic() +
+    xlab("Correlation") +
+    ylab("Dropout")
+```
+
+# Remove %dropout > 0.95
+
+```{r}
+df_sub <- df[df$pct_dropout < 0.95, ]
+```
+
+```{r}
+ggplot(df_sub, aes(x=corr, y=pct_dropout, color=celltype)) +
+    geom_point() +
+    theme_classic() +
+    xlab("Correlation") +
+    ylab("Dropout")
+```
+
+```{r}
+ggplot(df_sub, aes(pct_dropout)) +
+    geom_histogram(bins=50, alpha = 0.3, position = "identity", fill="pink", color="pink") +
+    theme_classic() +
+    xlab("% dropout (RNA expression == 0)") +
+    ggtitle("% dropout per celltype/gene")
+```
+
+```{r}
+ggplot(df_sub, aes(corr)) +
+    geom_histogram(bins=50, alpha = 0.3, position = "identity", fill="purple", color="purple") +
+    theme_classic() +
+    xlab("Pearson correlation coefficient") +
+    ggtitle("Pearson correlation: RNA vs protein")
+```
+
+# Remove corr != 0
+
+```{r}
+df_sub <- df[!(is.na(df$corr)),]
+df_sub <- df_sub[(df_sub$corr > 0.05) | (df_sub$corr < -0.05), ]
+```
+
+```{r}
+ggplot(df_sub, aes(x=corr, y=pct_dropout, color=celltype)) +
+    geom_point() +
+    theme_classic() +
+    xlab("Correlation") +
+    ylab("Dropout")
+```
+
+```{r}
+ggplot(df_sub, aes(pct_dropout)) +
+    geom_histogram(bins=50, alpha = 0.3, position = "identity", fill="pink", color="pink") +
+    theme_classic() +
+    xlab("% dropout (RNA expression == 0)") +
+    ggtitle("% dropout per celltype/gene")
+```
+
+```{r}
+ggplot(df_sub, aes(corr)) +
+    geom_histogram(bins=50, alpha = 0.3, position = "identity", fill="purple", color="purple") +
+    theme_classic() +
+    xlab("Pearson correlation coefficient") +
+    ggtitle("Pearson correlation: RNA vs protein")
+```

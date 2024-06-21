@@ -1,0 +1,282 @@
+---
+title: "Protein expression for pbmc_multimodal"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r}
+#' Create sub-chunks for plots
+#' Plotting function to generate plots of a specific dimension when html is knitted
+#'
+#' taken from: https://stackoverflow.com/questions/15365829/dynamic-height-and-width-for-knitr-plots
+#'
+#' @param pl a plot object
+#' @param fig.height figure height
+#' @param fig.width figure width
+#' @param chunk_name name of the chunk
+#'
+#' @author Andreas Scharmueller \email{andschar@@protonmail.com}
+#'
+subchunkify = function(pl,
+                       fig.height = 7,
+                       fig.width = 5,
+                       chunk_name = 'plot') {
+  pl_deparsed = paste0(deparse(function() {
+    pl
+  }), collapse = '')
+  
+  sub_chunk = paste0(
+    "```{r ",
+    chunk_name,
+    ", fig.height=",
+    fig.height,
+    ", fig.width=",
+    fig.width,
+    ", dpi=72",
+    ", echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}",
+    "\n(",
+    pl_deparsed,
+    ")()",
+    "\n```"
+  )
+  
+  cat(knitr::knit(
+    text = knitr::knit_expand(text = sub_chunk),
+    quiet = TRUE
+  ))
+}
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+# library(CSCORE)
+# library(WGCNA)
+library(ggpubr)
+library(ggvenn)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes: pbmc_multimodal"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+A brief overview of what the dataset looks like:
+
+```{r}
+# Load dataset
+# remotes::install_github("mojaveazure/seurat-disk", quiet=F)
+library(SeuratDisk)
+seurat <- LoadH5Seurat("../data/pbmc_multimodal.h5seurat")
+```
+
+```{r}
+# This dataset only came with ADT and SCT assays
+# The raw counts were stored in the "counts" slot of the SCT assay
+# Creating another RNA assay with the raw counts as CSCORE requires it
+raw_rna <- GetAssayData(object =  seurat[['SCT']], layer = 'counts')
+seurat[["RNA"]] <- CreateAssayObject(counts = raw_rna )
+seurat <- NormalizeData(seurat, assay="RNA")
+
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r fig.height=6}
+seurat$celltype <- seurat$celltype.l1
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = celltype,
+            fill=celltype),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle(glue("{name_project}\nCelltypes")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = celltype, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+```{r fig.height=5, fig.width=7}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nCelltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+# Protein -> RNA naming
+
+I am going to investigate the dropout rate more closely. 
+
+To start, I'm going to look at genes that have the same name as the protein in the dataset for a first pass look.
+
+```{r}
+# Protein names
+genes_adt <- sort(row.names(seurat[["ADT"]]))
+
+genes <- genes_adt[genes_adt %in% row.names(seurat[["RNA"]])]
+genes
+```
+
+# RNA vs Protein expression
+
+Here I am comparing the normalized protein expression after applying a log10 transormation.
+
+```{r}
+# Log scale the ADT counts
+counts_adt <- FetchData(seurat[["ADT"]], vars=genes)
+counts_adt <- log10(counts_adt + 0.01) - log10(0.01)
+
+# Log scale the RNA normalized counts
+counts_rna <- FetchData(seurat[["RNA"]], vars=genes)
+counts_rna <- log10(counts_rna + 0.01) - log10(0.01)
+
+# Celltype information for each cell
+celltype <- unname(seurat$celltype)
+```
+
+```{r results="asis", echo=FALSE}
+for (gene in genes) {
+    cat(glue("## {gene}\n\n"))
+    gene <- gene
+    protein <- gene
+
+
+    cat("### All cells\n")
+    title <- paste0("RNA ", gene, " vs Protein ", protein)
+    scatter <- ggplot() +
+        geom_point(aes(x=counts_rna[[gene]], y=counts_adt[[protein]], color=celltype)) +
+        theme_classic() +
+        xlab(glue("log10(RNA {gene})")) +
+        ylab(glue("log10(Protein {protein})")) +
+        geom_abline(slope=1, intercept = 0, color="red") +
+        stat_cor(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), method = "pearson", color="blue") +
+        ggtitle(title)
+
+    density <- ggplot() +
+        geom_bin2d(aes(x=counts_rna[[gene]], y=counts_adt[[protein]]), bins=100) +
+        scale_fill_continuous(type = "viridis") +
+        theme_classic() +
+        xlab(glue("log10(RNA {gene})")) +
+        ylab(glue("log10(Protein {protein})")) +
+        geom_abline(slope=1, intercept = 0, color="red")
+
+    p <- cowplot::plot_grid(scatter, density, ncol=2)
+    subchunkify(p, 6, 12, glue("{gene}_{protein}-scatter"))
+    cat("\n\n")
+
+
+    cat("### Venn Diagram\n")
+    cat("Here I am showing a venn diagram for the number/propotion of cells that 0 expression for each protein/gene pair. We are interested in the intersection, where we have cells that have expression in both RNA and Protein.\n")
+    bool_rna <- counts_rna[[gene]] != 0.0
+    bool_adt <- counts_adt[[gene]] != 0.0
+    df <- data.frame(bool_rna, bool_adt)
+    colnames(df) <- c("RNA", "Protein")
+    p <- ggvenn(
+        df, 
+        stroke_size = 0.5, 
+        set_name_size = 4) +
+        ggtitle(glue("RNA {gene} + Protein {protein}: Zero expression"))
+    subchunkify(p, 5, 5, glue("{gene}_{protein}-venn"))
+    cat("\n\n")
+
+
+
+    cat("### Remove cells with 0s\n")
+    cat("Now I remove any cell that has 0 expression from either RNA or Protein.\n")
+    title <- paste0("Non-zero: RNA ", gene, " vs Protein ", protein)
+    df <- data.frame(counts_rna[[gene]], counts_adt[[protein]], celltype)
+    colnames(df) <- c("RNA", "Protein", "celltype")
+    df <- df[df$RNA != 0,]
+    df <- df[df$Protein != 0,]
+
+    p <- ggplot(df) +
+        geom_bar(stat="count", aes(x=celltype, fill=celltype), color="black") +
+        theme_classic() +
+        ggtitle(title)
+    subchunkify(p, 6, 12, glue("{gene}_{protein}-bar_zero"))
+    cat("\n\n")
+
+    scatter <- ggplot() +
+        geom_point(aes(x=df$RNA, y=df$Protein, color=df$celltype)) +
+        theme_classic() +
+        xlab(glue("log10(RNA {gene})")) +
+        ylab(glue("log10(Protein {protein})")) +
+        geom_abline(slope=1, intercept = 0, color="red") +
+        stat_cor(aes(x=df$RNA, y=df$Protein), method = "pearson", color="blue") +
+        ggtitle(title)
+
+
+    density <- ggplot() +
+        geom_bin2d(aes(x=df$RNA, y=df$Protein), bins=100) +
+        scale_fill_continuous(type = "viridis") +
+        theme_classic() +
+        xlab(glue("log10(RNA {gene})")) +
+        ylab(glue("log10(Protein {protein})")) +
+        geom_abline(slope=1, intercept = 0, color="red")
+
+    p <- cowplot::plot_grid(scatter, density, ncol=2)
+    subchunkify(p, 6, 12, glue("{gene}_{protein}-scatter_zero"))
+    cat("\n\n")
+}
+```

@@ -1,0 +1,464 @@
+---
+title: "Protein expression for pbmc_multimodal"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+# library(CSCORE)
+# library(WGCNA)
+library(ggpubr)
+library(ggvenn)
+
+library(SAVER)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+```{r}
+#' Create sub-chunks for plots
+#' Plotting function to generate plots of a specific dimension when html is knitted
+#'
+#' taken from: https://stackoverflow.com/questions/15365829/dynamic-height-and-width-for-knitr-plots
+#'
+#' @param pl a plot object
+#' @param fig.height figure height
+#' @param fig.width figure width
+#' @param chunk_name name of the chunk
+#'
+#' @author Andreas Scharmueller \email{andschar@@protonmail.com}
+#'
+subchunkify = function(pl,
+                       fig.height = 7,
+                       fig.width = 5,
+                       chunk_name = 'plot') {
+  pl_deparsed = paste0(deparse(function() {
+    pl
+  }), collapse = '')
+  
+  sub_chunk = paste0(
+    "```{r ",
+    chunk_name,
+    ", fig.height=",
+    fig.height,
+    ", fig.width=",
+    fig.width,
+    ", dpi=72",
+    ", echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}",
+    "\n(",
+    pl_deparsed,
+    ")()",
+    "\n```"
+  )
+  
+  cat(knitr::knit(
+    text = knitr::knit_expand(text = sub_chunk),
+    quiet = TRUE
+  ))
+}
+```
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes: pbmc_multimodal"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+A brief overview of what the dataset looks like:
+
+```{r}
+# Load dataset
+# remotes::install_github("mojaveazure/seurat-disk", quiet=F)
+library(SeuratDisk)
+seurat <- LoadH5Seurat("../data/pbmc_multimodal.h5seurat")
+```
+
+```{r}
+# This dataset only came with ADT and SCT assays
+# The raw counts were stored in the "counts" slot of the SCT assay
+# Creating another RNA assay with the raw counts as CSCORE requires it
+# raw_rna <- GetAssayData(object =  seurat[['SCT']], layer = 'counts')
+# seurat[["RNA"]] <- CreateAssayObject(counts = raw_rna )
+# seurat <- NormalizeData(seurat, assay="RNA")
+
+# DefaultAssay(seurat) <- "RNA"
+```
+
+```{r fig.height=6}
+seurat$celltype <- seurat$celltype.l1
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = celltype,
+            fill=celltype),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle(glue("{name_project}\nCelltypes")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = celltype, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+```{r fig.height=5, fig.width=7}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nCelltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+# Protein -> RNA naming
+
+I am going to investigate the dropout rate more closely. 
+
+Since there are multiple different names for a gene, I am scraping the database for alternative names for the various proteins that were used in this dataset so we can look at as many instances of dropout as possible.
+
+I used the resources titled [Data from the Human Protein Atlas in tab-separated format](https://www.proteinatlas.org/about/download) from the Human Protein Atlas to get all possible naming conventions.
+
+```{r}
+genes_adt <- sort(row.names(seurat[["ADT"]]))
+genes_rna <- sort(row.names(seurat[["SCT"]]))
+```
+
+```{r}
+df <- read.csv("~/Downloads/proteinatlas.tsv", row.names=NULL, sep="\t")
+df <- df[c("Gene", "Gene.synonym")]
+
+list_gene <- c()
+list_syno <- c()
+
+for (idx in 1:nrow(df)) {
+    gene <- df[idx, "Gene"]
+    gene.synonym <- df[idx, "Gene.synonym"]
+    gene.synonym <- trimws(strsplit(gene.synonym, ",")[[1]])
+
+    for (g in gene.synonym) {
+        list_gene <- c(list_gene, gene)
+        list_syno <- c(list_syno, g)
+    }
+}
+
+df_gene <- data.frame(gene=list_gene, gene_syn=list_syno)
+df_gene <- df_gene %>% mutate(across(where(is.character), toupper))
+
+genes <- genes_adt[(genes_adt %in% df_gene$gene) | (genes_adt %in% df_gene$gene_syn)]
+
+list_protein <- c()
+list_rna <- c()
+for (protein in genes) {
+    df_protein <- df_gene[(df_gene$gene == protein) | (df_gene$gene_syn == protein),]
+    gene_names <- unlist(unname(as.list(df_protein)))
+
+    rna <- unique(gene_names[gene_names %in% genes_rna])
+    if (rlang::is_empty(rna) | length(rna) > 1) {
+        print(paste0(protein, " : ", rna))
+        next
+    }
+
+    list_protein <- c(list_protein, protein)
+    list_rna <- c(list_rna, rna)
+}
+
+
+df_genes <- data.frame(protein=list_protein, rna=list_rna) 
+df_genes
+```
+
+# RNA vs Protein expression
+
+Here I am applying a log10 tranformation to the normalized protein and RNA matrices for the genes that we are interested in.
+
+```{r}
+# Log scale the ADT counts
+counts_adt <- FetchData(seurat[["ADT"]], vars=df_genes$protein)
+# counts_adt <- log10(counts_adt + 0.01) - log10(0.01)
+
+# Log scale the RNA SCT normalized counts
+counts_rna <- FetchData(seurat[["SCT"]], vars=df_genes$rna)
+counts_rna <- log10(counts_rna + 0.01) - log10(0.01)
+
+# Celltype information for each cell
+celltype <- unname(seurat$celltype)
+counts_rna$celltype <- celltype
+counts_adt$celltype <- celltype
+```
+
+# Calculate: %dropout + correlation
+
+Here I am subsetting the cells by celltype. Then using the list of genes (shown above) I am computing the proportion of dropout (RNA expression == 0) as well as the pearson correlation coefficient when comparing RNA vs Protein expression.
+
+```{r}
+seurat$celltype <- seurat$celltype.l1
+celltypes <- sort(unique(seurat$celltype))
+
+list_dropout <- list()
+list_corr <- list()
+
+for (ct in celltypes) {
+    print(ct)
+
+    counts_adt_ct <- counts_adt[counts_adt$celltype == ct, ]
+    counts_rna_ct <- counts_rna[counts_rna$celltype == ct, ]
+
+    ct_dropout <- c()
+    ct_corr <- c()
+
+    for (idx in 1:nrow(df_genes)) {
+        protein <- df_genes[idx, "protein"]
+        gene <- df_genes[idx, "rna"]
+
+        pct_dropout <- sum(counts_rna_ct[gene] == 0.0) / dim(counts_rna_ct)[1]
+        ct_dropout <- c(ct_dropout, pct_dropout)
+
+        # # Subset out 0 RNA expression
+        # df <- data.frame(counts_rna_ct[[gene]], counts_adt_ct[[protein]])
+        # colnames(df) <- c("RNA", "Protein")
+        # df <- df[df$RNA != 0,]
+
+        correlation <- cor(counts_rna_ct[[gene]], counts_adt_ct[[protein]], method="pearson") %>% as.numeric
+        ct_corr <- c(ct_corr, correlation)
+    }
+
+    names(ct_dropout) <- df_genes$rna
+    names(ct_corr) <- df_genes$rna
+
+    list_dropout[[ct]] <- ct_dropout
+    list_corr[[ct]] <- ct_corr
+}
+
+df_dropout <- data.frame(list_dropout)
+df_corr <- data.frame(list_corr)
+```
+
+```{r}
+df_corr_melt <- df_corr %>%
+                    rownames_to_column("gene") %>%
+                    pivot_longer(cols = -gene, names_to = "celltype", values_to = 'corr')
+
+df_dropout_melt <- df_dropout %>%
+                    rownames_to_column("gene") %>%
+                    pivot_longer(cols = -gene, names_to = "celltype", values_to = 'pct_dropout')
+
+df <- merge(df_corr_melt, df_dropout_melt, by=c("celltype", "gene"))
+df
+```
+
+
+# Top protein-gene pairs
+
+Selecting the top 3 genes/proteins based on the correlation scores per celltype.
+
+```{r}
+# MAGIC
+# Load conda environment
+myenvs <- reticulate::conda_list()
+envname <- myenvs$name[3]
+reticulate::use_condaenv(envname, required = TRUE)
+
+library(Rmagic)
+```
+
+```{r results="asis", echo=FALSE}
+for (ct in celltypes) {
+
+    cat(glue("## {ct}\n\n"))
+
+    # Subset counts by celltype
+    counts_adt_ct <- counts_adt[counts_adt$celltype == ct, ]
+    counts_rna_ct <- counts_rna[counts_rna$celltype == ct, ]
+
+    # Get top 3 genes
+    df_sub <- df[df$celltype == str_replace(ct, " ", "."),] %>% arrange(desc(corr))
+    df_sub <- df_sub[1:3,]
+    cat(knitr::knit_print(df_sub))
+    cat("\n\n")
+
+    # Get raw counts and run magic
+    raw_rna <- FetchData(seurat[["RNA"]], vars=df_sub$gene, layer="counts")
+    raw_rna <- raw_rna[row.names(raw_rna) %in% row.names(counts_adt_ct), ]
+    data_magic <- magic(raw_rna)$result
+    data_magic <- log10(data_magic + 0.01) - log10(0.01)
+
+    # Generate SAVER predictions for those genes
+    data_saver <- saver(t(raw_rna), estimates.only = TRUE, ncores=6)
+    data_saver <- data.frame(t(data_saver))
+    data_saver <- log10(data_saver + 0.01) - log10(0.01)
+
+    cat("\n\n")
+
+    for (gene in df_sub$gene) {
+        protein <- df_genes[df_genes$rna == gene, "protein"]
+        cat(glue("### {gene}/{protein}\n\n"))
+
+        df_gene <- data.frame(rna=counts_rna_ct[gene], protein=counts_adt_ct[protein])
+        colnames(df_gene) <- c("rna", "protein")
+        # df_gene <- df_gene[df_gene$rna != 0,]
+
+        density <- ggplot(df_gene) +
+            geom_bin2d(aes(x=rna, y=protein), bins=100) +
+            scale_fill_continuous(type = "viridis") +
+            theme_classic() +
+            xlab(glue("log10(RNA {gene})")) +
+            ylab(glue("log10(Protein {protein})")) +
+            geom_abline(slope=1, intercept = 0, color="red") +
+            ggtitle(gene)
+
+        # adt_hist <- ggplot(df_gene) +
+        #     geom_histogram(aes(protein), bins=100) +
+        #     xlab(protein) +
+        #     theme_classic() +
+        #     ggtitle(glue("{ct}: protein {protein}"))
+        Idents(seurat) <- "celltype"
+        adt_hist <- RidgePlot(seurat, features = protein, assay="ADT") + NoLegend()
+
+
+        p <- cowplot::plot_grid(density, adt_hist, ncol=2)
+        subchunkify(p, 5, 10, glue("{ct}_{protein}-{gene}"))
+        cat("\n\n")
+
+        p_magic <- ggplot() +
+                    geom_bin2d(aes(x=data_magic[[gene]], y=counts_adt_ct[[protein]]), bins=100) +
+                    scale_fill_continuous(type = "viridis") +
+                    theme_classic() +
+                    xlab(glue("log10(MAGIC {gene})")) +
+                    ylab(glue("log10(Protein {protein})")) +
+                    geom_abline(slope=1, intercept = 0, color="red") +
+                    ggtitle(glue("MAGIC: {gene}"))
+
+    df_saver <- data.frame(protein=counts_adt_ct[[protein]])
+    df_saver$cb <- row.names(counts_adt_ct)
+
+    tmp <- data_saver[gene]
+    tmp$cb <- row.names(tmp)
+    df_saver <- left_join(df_saver, tmp, by="cb")
+    colnames(df_saver) <- c("protein", "cb", "gene")
+
+    p_saver <- ggplot(df_saver) +
+                geom_bin2d(aes(x=gene, y=protein), bins=100) +
+                scale_fill_continuous(type = "viridis") +
+                theme_classic() +
+                xlab(glue("log10(SAVER {gene})")) +
+                ylab(glue("log10(Protein {protein})")) +
+                geom_abline(slope=1, intercept = 0, color="red") +
+                ggtitle(glue("SAVER: {gene}")) +
+                xlim(0, NA) +
+                ylim(0, NA)
+
+    p <- cowplot::plot_grid(p_magic, p_saver, ncol=2)
+    subchunkify(p, 5, 10, glue("{ct}_{protein}-{gene}_imputed"))
+    cat("\n\n")
+
+    avg_rna <- mean(counts_rna_ct[[gene]])
+    avg_magic <- mean(data_magic[[gene]])
+    avg_saver <- mean(df_saver$gene, na.rm=T)
+
+    dropout_rna <- df_sub[df_sub$gene == gene, "pct_dropout"]
+    dropout_magic <- sum(data_magic[[gene]] == 0) / dim(data_magic)[1]
+    dropout_saver <- sum((df_saver$gene == 0) | is.na(df_saver$gene)) / dim(data_magic)[1]
+
+    corr_rna <- df_sub[df_sub$gene == gene, "corr"]
+
+    df_magic <- data.frame(protein=counts_adt_ct[[protein]])
+    df_magic$cb <- row.names(counts_adt_ct)
+    tmp <- data_magic[gene]
+    tmp$cb <- row.names(tmp)
+    df_magic <- left_join(df_magic, tmp, by="cb")
+    colnames(df_magic) <- c("protein", "cb", "gene")
+
+    corr_magic <- cor(df_magic$gene, df_magic$protein, method="pearson", use="complete.obs") %>% as.numeric
+    corr_saver <- cor(df_saver$gene, df_saver$protein, method="pearson", use="complete.obs") %>% as.numeric
+
+
+    df_stats <- data.frame(sct=c(avg_rna, dropout_rna, corr_rna), 
+                            magic=c(avg_magic, dropout_magic, corr_magic), 
+                            saver=c(avg_saver, dropout_saver, corr_saver))
+    row.names(df_stats) <- c("avg", "dropout", "corr")
+
+    cat(knitr::knit_print(df_stats))
+    cat("\n\n")
+    }
+}
+```
+
+# Conclusions
+
+Based on the few cases for each celltype shown above, it seems like SCT, MAGIC, and SAVER mostly give the same correlation scores - with some variance. I would say MAGIC tends to give similar correlation scores with a slight increase to dropout as a trend. Whereas SAVER can sometimes return much higher or lower correlation scores when compared to SCT, but will always have lower numbers of dropout. 
+
+I will run these metrics on the entire dataset to more conclusively say what the average scores for each of these metrics are as a next step. 
+
+# Next steps
+
+I believe the next steps to take are to put everything that we have done so far and put it all together. I envision the workflow to be something akin to this:
+
+1. We know that there is a lot of dropout from scRNA experiments, which we want to take into account. To assess how bad the dropout we used an ADT dataset (protein expression as ground truth) to establish which imputation methods we think best recovers this information:
+    a. MAGIC
+    b. SAVER
+2. We additionally have several different methods to determine which pairs of genes we think are correlated:
+    a. Pearson correlation (on SCT, MAGIC, SAVER imputed matrices)
+    b. CS-CORE
+3. We can assess how these correlation matrices differ from one another using WGCNA
+    a. Compare SCT, MAGIC, SAVER, CS-CORE co-expression matrices
+4. With all of this information, we can filter our to give us a finalized list of correlated gene pairs that we can choose from. We can select these pairs based on metrics that we believe are robust, such as:
+    a. Percent cells that express both genes
+    b. Average expression of each gene
+    c. Gene pairs that belong to the same module
+    d. Correlation estimate scores (set minimum values)
