@@ -1,0 +1,442 @@
+---
+title: "Merck - CS-CORE mD_sandbox"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r}
+#' Create sub-chunks for plots
+#' Plotting function to generate plots of a specific dimension when html is knitted
+#'
+#' taken from: https://stackoverflow.com/questions/15365829/dynamic-height-and-width-for-knitr-plots
+#'
+#' @param pl a plot object
+#' @param fig.height figure height
+#' @param fig.width figure width
+#' @param chunk_name name of the chunk
+#'
+#' @author Andreas Scharmueller \email{andschar@@protonmail.com}
+#'
+subchunkify = function(pl,
+                       fig.height = 7,
+                       fig.width = 5,
+                       chunk_name = 'plot') {
+  pl_deparsed = paste0(deparse(function() {
+    pl
+  }), collapse = '')
+  
+  sub_chunk = paste0(
+    "```{r ",
+    chunk_name,
+    ", fig.height=",
+    fig.height,
+    ", fig.width=",
+    fig.width,
+    ", dpi=72",
+    ", echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}",
+    "\n(",
+    pl_deparsed,
+    ")()",
+    "\n```"
+  )
+  
+  cat(knitr::knit(
+    text = knitr::knit_expand(text = sub_chunk),
+    quiet = TRUE
+  ))
+}
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(scales)
+library(ggh4x)
+library(gridExtra)
+library(pheatmap)
+library(devtools)
+
+library(CSCORE)
+library(WGCNA)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+
+axis <- ggh4x::guide_axis_truncated(
+  trunc_lower = unit(0, "npc"),
+  trunc_upper = unit(2, "cm")
+)
+```
+
+# Project details
+
+``` {r}
+set.seed(2023)
+
+name_project <- "Co-expression of genes: mD Sandbox"
+name_pi <- "Merck"
+
+name_file <- gsub(" ", "_", name_project)
+name_file <- gsub("-", "_", name_file)
+```
+
+
+<b>Dataset background</b>
+
+This is a sc-RNA-Seq data that James merged from individual sorted pbmc subset populations that he downloaded from here:
+https://www.10xgenomics.com/resources/datasets?query=&page=1&configure%5Bfacets%5D%5B0[…]s%5D%5B1%5D=pipeline.version&configure%5BhitsPerPage%5D=500
+
+A brief overview of what the dataset looks like:
+
+```{r}
+# Load dataset
+# seurat <- readRDS("../data/mD_Sandbox.rds")
+
+# seurat <- NormalizeData(seurat)
+# seurat <- FindVariableFeatures(seurat, selection.method = "vst", nfeatures = 2000)
+# seurat <- ScaleData(seurat)
+# seurat <- RunPCA(seurat, features = VariableFeatures(object = seurat))
+# seurat <- FindNeighbors(seurat, dims = 1:40)
+# seurat <- FindClusters(seurat)
+# seurat <- RunUMAP(seurat, dims = 1:40)
+
+# saveRDS(seurat, "../data/mD_Sandbox_integrated.rds")
+seurat <- readRDS("../data/mD_Sandbox_integrated.rds")
+```
+
+```{r fig.height=6}
+seurat$celltype <- seurat$orig.ident
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = celltype,
+            fill=celltype),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle(glue("{name_project}\nCelltypes")) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = celltype, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+```{r fig.height=5, fig.width=7}
+Idents(seurat) <- "celltype"
+p <- DimPlot(seurat, reduction = "umap") +
+    xlab("UMAP1") +
+    ylab("UMAP2") +
+    ggtitle(glue("{name_project}\nCelltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(), axis.ticks.y=element_blank(),
+        axis.title=element_text(size=8, face="bold")) +
+    guides(x = axis, y = axis) +
+    theme(axis.line = element_line(arrow = arrow(type = "closed"), size = 1),
+        axis.title = element_text(hjust = 0))
+LabelClusters(p, id = "ident",  fontface = "bold", size = 3, bg.colour = "white", bg.r = .2, force = 0)
+```
+
+# Surfaceome genes
+```{r}
+# surfaceome <- read.csv("../data/surfaceome.csv")
+
+# library('biomaRt')
+# mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+# gene_IDs <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"),
+#               values = surfaceome$ENSEMBL.Gene.ID, mart= mart)
+
+# surfaceome_genes <- left_join(x = surfaceome, y = gene_IDs, by = c("ENSEMBL.Gene.ID" = "ensembl_gene_id"))
+# surfaceome_genes <- surfaceome_genes$hgnc_symbol
+
+# surfaceome_genes <- rownames(seurat$RNA)[rownames(seurat$RNA) %in% surfaceome_genes]
+
+# write.csv(surfaceome_genes, "../data/surfaceome_genes.csv")
+surfaceome_genes <- read.csv("../data/surfaceome_genes.csv")$x
+as.data.frame(surfaceome_genes)
+```
+
+# Installing CS-CORE
+
+The installation process for the tool is very straightforward and I had no issues getting it working. 
+
+```{r}
+# ## Load devtools for installing R packages from Github
+# library(devtools)
+# ## Install CS-CORE from Github
+# install_github("ChangSuBiostats/CS-CORE")
+```
+
+# Running CS-CORE
+
+In the vignette for [CS-CORE](https://changsubiostats.github.io/CS-CORE/articles/CSCORE.html) they subset their dataset by a singular celltype and then input their correlation matrix into [WGCNA](https://cran.r-project.org/web/packages/WGCNA/index.html) in order to determine modules of genes. 
+
+```{r fig.height=6}
+celltypes <- sort(unique((seurat$celltype)))
+
+Idents(seurat) <- "celltype"
+seurat@meta.data %>% 
+    ggplot() +
+    geom_bar(aes(
+        x = Idents(seurat),
+        fill = Idents(seurat)), stat = "count", color = "black", show.legend = FALSE) +
+    theme_classic() +
+    xlab("Celltype") +
+    ylab("Number of Cells") +
+    ggtitle(glue("{name_project}\nManual celltypes")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    geom_text(aes(x = Idents(seurat), label = after_stat(count)), stat = "count", vjust = -0.5) +
+    theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+# Co-expression by celltypes
+
+```{r results="asis", echo=FALSE}
+for (ct in celltypes) {
+
+    cat(paste0("## ", ct, "\n\n"))
+    cat(paste0("To save computation time, I remove genes that have 0 counts in the ", ct, " subsetted dataset.\n"))
+    seurat_sub <- subset(seurat, subset=(celltype == ct))
+
+    # Removing genes that have 0 counts across all cells of the celltype
+    counts <- seurat_sub[["RNA"]]@counts
+    genes.use <- rowSums(counts) > 0
+    genes.use <- names(genes.use[genes.use])
+    seurat_sub <- seurat_sub[genes.use, ]
+
+    # Surfaceome genes in the dataset
+    genes <- surfaceome_genes[surfaceome_genes %in% row.names(seurat_sub)]
+    n_genes <- length(genes)
+
+    cat(paste0("After this gene filtration, we have ", n_genes, " genes from the surfaceome to use as input for CS-CORE.\n\n"))
+
+    # Run CS-CORE
+    CSCORE_result <- CSCORE(seurat_sub, genes = genes)
+
+
+
+    cat("\n\n### Co-expression heatmap\n\n")
+    cat(paste0("Here we can see the estimated correlation estimates within the ", ct, " cells.\n\n"))
+    p <- pheatmap(CSCORE_result$est, show_colnames = FALSE, show_rownames = FALSE, silent=TRUE)
+    subchunkify(p, n_genes/10, n_genes/10, glue("{ct}-coexp"))
+    cat("\n\n")
+
+
+
+    cat("### BH-adjusted matrix\n\n")
+    cat("The vignette then has us replace gene pairs that are no significant to be 0 within the estimated co-expression matrix. This step is necessary in order to feed the CS-CORE co-expression estimated into WGCNA to determine gene modules as it originally takes in a pearson correlation matrix.\n\n") 
+    cat("In essence, we are setting the co-expression values of non-significant gene pairs to be 0 - which in the context of a pearson correlation matrix would mean that the pairs are not correlated and therefore will not have co-expression.\n\n")
+    cat("The modified matrix now looks like this, with the 0'd values:\n\n")
+
+    # Obtain CS-CORE co-expression estimates
+    CSCORE_coexp <- CSCORE_result$est
+
+    # Obtain BH-adjusted p values
+    CSCORE_p <- CSCORE_result$p_value
+    p_matrix_BH <- matrix(0, length(genes), length(genes))
+    p_matrix_BH[upper.tri(p_matrix_BH)] <- p.adjust(CSCORE_p[upper.tri(CSCORE_p)], method = "BH")
+    p_matrix_BH <- p_matrix_BH + t(p_matrix_BH)
+
+    # Set co-expression entires with BH-adjusted p-values greater than 0.05 to 0
+    CSCORE_coexp[p_matrix_BH > 0.05] <- 0
+
+    p <- pheatmap(CSCORE_coexp, show_colnames = FALSE, show_rownames = FALSE, silent=TRUE)
+    subchunkify(p, n_genes/10, n_genes/10, glue("{ct}-coexp_zero"))
+    cat("\n\n")
+
+    
+    genes.use <- rowSums(CSCORE_coexp) > 1.0
+    genes.use <- names(genes.use[genes.use])
+    n_genes <- length(genes.use)
+    cat(glue("Now we want to remove genes that have no significant correlated expression with any genes. In doing so, we are now working with {n_genes} for this analysis.\n\n"))
+    CSCORE_coexp <- CSCORE_coexp[genes.use, genes.use]
+    p <- pheatmap(CSCORE_coexp, show_colnames = FALSE, show_rownames = FALSE, silent=TRUE)
+    subchunkify(p, n_genes/10, n_genes/10, glue("{ct}-coexp_zero_subset"))
+    cat("\n\n")
+
+
+    cat("### WGCNA\n\n")
+    cat("We then feed this 0'd co-expression matrix into WGCNA.\n\n")
+    # Compute the adjacency matrix based on the co-expression matrix
+    adj <- WGCNA::adjacency.fromSimilarity(abs(CSCORE_coexp), power = 1)
+    # Compute the topological overlap matrix
+    TOM <- WGCNA::TOMsimilarity(adj)
+    dissTOM <- 1-TOM
+    rownames(dissTOM) <- colnames(dissTOM) <- genes.use
+    # Run hierarchical clustering as in the WGCNA workflow
+    hclust_dist <- hclust(as.dist(dissTOM), method = "average") 
+    memb <- dynamicTreeCut::cutreeDynamic(dendro = hclust_dist, 
+                        distM = dissTOM, 
+                        deepSplit = 2,
+                        pamRespectsDendro = FALSE,
+                        minClusterSize = 10)
+    # For more instructions on how to tune the parameters in the WGCNA workflow,
+    # please refer to https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/
+
+    names(memb) <- genes.use
+    memb_tab <- table(memb)
+    module_list <- lapply(sort(unique(memb)), function(i_k) names(which(memb == i_k)))
+
+    module_df <- data.frame(memb)
+    module_df$memb <- as.character(module_df$memb)
+    df <- module_df
+    df <- tibble::rownames_to_column(df, "gene")
+    colnames(df) <- c("gene", "module")
+
+    cat(knitr::knit_print(df))
+    cat("\n\n\n")
+    cat("We are now given a list of modules with groups of genes that are co-expressed together in our dataset.\n\n")
+
+
+
+    cat("### CS-CORE correlation estimates for modules\n")
+    cat("Please note that this is the same correlation matrix in the section 'Co-expression heatmap', but now with annotations for the modules those genes belong to. There are no overlaps of genes among the modules.\n\n")
+
+    module_df$genes <- row.names(module_df)
+    anno <- module_df[, c("memb"), drop=F]
+    # Co-expression matrix of only genes in the module
+    coex_est <- CSCORE_result$est[module_df$genes, module_df$genes]
+    p <- pheatmap(coex_est, show_colnames=F, 
+            show_rownames=F, annotation_col=anno, annotation_row=anno, silent=T)
+    subchunkify(p, n_genes/10, n_genes/10, glue("{ct}-module_coex"))
+    cat("\n\n")
+
+    # Get coexpression pairs estimate
+    coex_df <- reshape2::melt(coex_est)
+    colnames(coex_df) <- c("Var1", "Var2", "coex_est")
+
+    # Get p-value of coexpression pairs
+    p_est <- CSCORE_result$p_value[module_df$genes, module_df$genes]
+    p_est <- reshape2::melt(p_est)
+    coex_df$p_value <- p_est$value
+
+    # Remove pairs with coexpression = 0
+    # Remove pairs of the same gene (correlation will automatically be 1)
+    coex_df <- coex_df %>% 
+            filter(coex_est != 0) %>% 
+            filter(Var1 != Var2)
+
+    # Remove non-significant correlations
+    coex_df <- coex_df %>%
+        filter(p_value <= 0.05) %>%
+        arrange(p_value)
+
+
+    # Add module information
+    coex_df$Var1_module <- coex_df$Var1
+    coex_df$Var2_module <- coex_df$Var2
+    for (idx in 1:nrow(module_df)) {
+        module <- module_df[idx, ]$memb
+        gene <- module_df[idx, ]$genes
+
+        coex_df$Var1_module <- str_replace(coex_df$Var1_module, paste0(gene, "$"), module)
+        coex_df$Var2_module <- str_replace(coex_df$Var2_module, paste0(gene, "$"), module)
+    }
+
+    # Remove pairs that are the same but ordered differently
+    # Ex. (Var1, Var2) = (Var2, Var1)
+    pairs <- c()
+    for (idx in 1:nrow(coex_df)) {
+        pair <- sort(c(coex_df[idx, ]$Var1, coex_df[idx, ]$Var2))
+        pair <- paste0(pair[1], "+", pair[2])
+        pairs <- c(pairs, c(pair))
+    }
+    coex_df$pairs <- pairs
+    coex_df <- coex_df[!duplicated(coex_df$pairs), ]
+
+    # Save output
+    write.csv(coex_df, glue("02.1_results-cs_core/{ct}.csv"))
+
+
+
+    cat("### Top co-expressed pairs\n\n")
+    cat(glue("I have removed gene pairs that are not significant (0.05) and sorted the values by p-value to more easily identify interesting gene pairs within {ct}. I have also written out the results as a csv file before this filtration in case there are other thresholds we want to explore.\n\n"))
+    # Remove non-significant correlations
+    coex_df <- coex_df %>%
+        filter(p_value <= 0.05) %>%
+        arrange(p_value)
+    cat(knitr::knit_print(coex_df))
+    
+    cat("\n\n\n")
+
+
+
+    cat("### Scatterplot top pair\n\n")
+    cat(glue("As a sanity check, I wanted to visualize the expression of the top correlated pair within the {ct} population. I selected the top significant gene pair that had more than 100 cells expressing both genes.\n\n"))
+
+    n_cells <- 0
+    idx <- 1
+    while (n_cells < 100) {
+        # Gene name of top co-expressed genes
+        gene_1 <- as.character(coex_df[idx, "Var1"])
+        gene_2 <- as.character(coex_df[idx, "Var2"])
+        # Counts for genes
+        counts <- data.frame(t(data.frame(seurat_sub$RNA@data[c(gene_1, gene_2), ])))
+        colnames(counts) <- c(gene_1, gene_2)
+
+        n_zero <- dim(counts)[1]
+        n_cells <- dim(counts)[1]
+        # Remove cells with 0 expression for both genes
+        counts_zero <- counts[rowSums(counts) > 0, ]
+        n_zero <- n_zero - dim(counts_zero)[1]
+
+        n_cells <- dim(counts_zero)[1]
+        idx <- idx + 1
+    }
+
+    # Scatterplot
+    scatter <- ggplot(counts) +
+        geom_point(aes(x=get(gene_1), y=get(gene_2))) +
+        scale_fill_continuous(type = "viridis") +
+        theme_classic() +
+        xlab(gene_1) +
+        ylab(gene_2) +
+        geom_abline(slope=1, intercept = 0, color="red")
+
+    cat(glue("As the scatterplot can make it difficult to see how many cells overlap at the same values, I have taken the same information displayed as a density plot. To create a better scale, I removed cells that have 0 expression for both genes ({n_zero} cells).\n\n"))
+
+    # Density scatterplot
+    density <- ggplot(counts_zero) +
+        geom_bin2d(aes(x=get(gene_1), y=get(gene_2)), bins=70) +
+        scale_fill_continuous(type = "viridis") +
+        theme_classic() +
+        xlab(gene_1) +
+        ylab(gene_2) +
+        geom_abline(slope=1, intercept = 0, color="red")
+
+    p <- cowplot::plot_grid(scatter, density, ncol=2)
+    subchunkify(p, 6, 13, glue("{ct}-scatter"))
+    cat("\n\n")
+}
+```
+
+# Next
+
+This is the FACs sorted datset - compare the genes they were sorted on.
