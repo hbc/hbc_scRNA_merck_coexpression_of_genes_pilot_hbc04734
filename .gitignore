@@ -1,0 +1,6 @@
+*.html
+MAGIC
+.DS_Store
+papers
+plots
+*rds
