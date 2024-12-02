@@ -1,0 +1,271 @@
+---
+title: "Correlation workflow"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(pheatmap)
+library(gridExtra)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+```
+
+# User define values
+
+```{r}
+celltypes <- c("Mono", "CD4 T", "CD8 T", "NK", "B", "other T", "DC")
+idx <- 3
+```
+
+```{r}
+path_seurat <- "../data/pbmc_multimodal.h5seurat"
+path_outs <- "results/rm_dropout_2"
+
+col_sample <- "orig.ident"
+col_celltype <- "celltype.l1"
+ct <- celltypes[idx]
+
+# Filtration parameters
+filter <- FALSE
+min_exp <- 0.2
+min_cells <- 40
+min_perc <- 0.2
+```
+
+- Path seurat: `r path_seurat`
+- Metadata column with celltypes: `r col_celltype`
+- Celltype to subset to: `r ct`
+- Filter genes based on expression and frequency: `r filter`
+
+
+# Load seurat object
+
+```{r}
+filename <- glue("data/{ct}.RDS")
+seurat <- readRDS(filename)
+seurat
+```
+
+
+# Genes
+
+List of all genes:
+
+```{r}
+# Fill in the list of genes you are interested in calculating correlations for
+corr_genes_all <- read.csv("protein_gene_map.csv")$gene
+as.data.frame(corr_genes_all)
+```
+
+Starting off with `r length(corr_genes_all)` genes of interest.
+
+
+# Subset to `r ct` cells
+
+```{r}
+seurat <- subset(seurat, celltype == ct)
+
+# Manual change
+# This dataset only came with ADT and SCT assays
+# The raw counts were stored in the "counts" slot of the SCT assay
+# Creating another RNA assay with the raw counts as CSCORE requires it
+raw_rna <- GetAssayData(object =  seurat[['SCT']], layer = 'counts')
+seurat[["RNA"]] <- CreateAssayObject(counts = raw_rna)
+seurat <- NormalizeData(seurat, assay = "RNA")
+
+DefaultAssay(seurat) <- "RNA"
+# Removing genes that have 0 counts across all cells of the celltype
+genes.use <- rowSums(raw_rna) > 0
+genes.use <- names(genes.use[genes.use])
+seurat <- seurat[genes.use, ]
+
+n_cells <- ncol(seurat)
+```
+
+Working with `r n_cells` cells.
+
+```{r}
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = get(col_sample),
+            fill = get(col_sample)),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        ggtitle(glue("{ct} cells: Sample distribution")) +
+        ylab("Number of Cells") +
+        xlab("Sample") +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = get(col_sample), label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Subset genes of interest
+
+From the genes that were supplied, removing any that are not expressed in this dataset.
+
+```{r}
+corr_genes <- corr_genes_all[corr_genes_all %in% rownames(seurat)]
+as.data.frame(corr_genes)
+```
+
+Next we look at the basic distribution of remaining genes of interest in terms of expression and number of cells they are expressed in.
+
+These are the following filtration metrics that are set:
+
+- Average expression < `r min_exp`
+- Number of cells expressed in > `r min_cells`
+- Percentage of cells expressed in > `r min_perc`
+
+Filtration parameter was set to `r filter`. If FALSE, no further filtration will be done at this step.
+
+```{r}
+data_rna <- FetchData(seurat[["RNA"]], vars=corr_genes, layer="data")
+
+# Number of cells a gene is expressed in
+num_cells <- colSums(data_rna > 0)
+# Percentage of cells a gene is expressed in
+perc_cells <- num_cells / ncol(seurat)
+# Average expression of a gene
+avg_expression <- colMeans(data_rna)
+
+df_genes <- data.frame(num_cells, perc_cells, avg_expression)
+df_genes <- df_genes %>% mutate(filter = !((perc_cells > min_perc) & (num_cells > min_cells) & (avg_expression > min_exp)))
+df_genes$gene <- row.names(df_genes)
+df_genes <- df_genes %>% arrange(desc(avg_expression), desc(perc_cells))
+
+df_genes
+```
+
+```{r}
+df_genes %>% ggplot() +
+    geom_point(aes(x = perc_cells, y = avg_expression, color = filter)) +
+    theme_classic()
+```
+
+```{r}
+if (filter == TRUE) {
+    corr_genes <- (df_genes %>% subset(filter == FALSE))$gene
+}
+```
+
+`r length(corr_genes)` genes of interest remaining.
+
+# Correlation Estimates
+
+Removing cells that have 0 expression of at least one of the genes in the calculation:
+
+```{r}
+# Store output so we don't have to re-run correlation each time
+filename <- glue("{path_outs}/corr_{ct}.csv")
+
+if (!file.exists(filename)) {
+
+    # Compute spearman correlation for each method (except CS-CORE which is run later)
+    # Unique combination of each gene pair
+    genes_comb <- data.frame(t(combn(corr_genes, 2)))
+    n_comb <- nrow(genes_comb)
+
+    # Create dataframe with correlation and p-values scores
+    df_corr <- genes_comb %>% rename("Var1" = X1, "Var2" = X2)
+    df_corr["rm_dropout"] <- NA
+    df_p_val <- df_corr
+
+    for (idx in 1:n_comb) {
+        assay_ <- "rm_dropout"
+
+        if (idx %% 200 == 0) {
+            print(glue("{idx}/{n_comb} correlations computed."))
+        }
+
+        # Name of genes to run correlation on
+        gene_1 <- genes_comb[idx, 1]
+        gene_2 <- genes_comb[idx, 2]
+
+        gene_exp <- FetchData(seurat, assay="RNA", layer="data", vars=c(gene_1, gene_2))
+        gene_exp <- gene_exp %>% subset((get(gene_1) > 0) & (get(gene_2) > 0))
+
+
+        if (nrow(gene_exp) <= 1) {
+            # If a gene has no expression, set correlation = 0 and p-value = 1
+            corr_val <- 0.0
+            p_val <- 1.0
+        } else {
+            # Calculate spearman correlation and p-value otherwise
+            tmp <- cor.test(gene_exp[[gene_1]], gene_exp[[gene_2]], method = "spearman", exact = FALSE)
+            corr_val <- as.numeric(unname(tmp$estimate))
+            p_val <- as.numeric(tmp$p.value)
+        }
+
+        # Store correlation and p-values
+        df_corr[idx, assay_] <- corr_val
+        df_p_val[idx, assay_] <- p_val
+    }
+
+    # Save output
+    write.csv(df_corr, filename)
+    write.csv(df_p_val, glue("{path_outs}/p_corr_{ct}.csv"))
+}
+
+df_corr <- read.csv(filename, row.names=1)
+df_p_val <- read.csv(glue("{path_outs}/p_corr_{ct}.csv"), row.names=1)
+```
+
+## Heatmap of correlation estimates
+
+Showing the patterns of correlation for each method. The x-axis and y-axis are the genes of interest with the corresponding correlation value for the pair as the value. Keep in mind that this is symmetric matrix.
+
+```{r results = "asis"}
+library(RColorBrewer)
+methods <- c("rm_dropout")
+
+for (method in methods) {
+    corr <- df_corr[c("Var1", "Var2", method)]
+    corr_cp <- corr %>% rename(Var1 = Var2, Var2 = Var1)
+    corr <- rbind(corr, corr_cp)
+    mtx <- reshape2::dcast(corr, Var2 ~ Var1) %>% column_to_rownames("Var2")
+
+    # Set the diagonal values: Correlation = 1, p-value = 1
+    mtx <- as.matrix(mtx)
+    diag(mtx) <- 1
+
+    breaks <-  seq(-1, 1, by = 0.1)
+    color <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(breaks))
+
+
+    p <- pheatmap(mtx, show_rownames = FALSE, show_colnames = FALSE,
+                color = color, breaks = breaks, silent = FALSE, main = method)
+    knit_print(p)
+}
+```

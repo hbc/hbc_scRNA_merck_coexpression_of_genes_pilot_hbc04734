@@ -1,0 +1,126 @@
+---
+title: "Correlation workflow"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(pheatmap)
+library(devtools)
+library(gridExtra)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+```
+
+# User define values
+
+```{r}
+celltypes <- c("Mono", "CD4 T", "CD8 T", "NK", "B", "other T", "DC")
+idx <- 1
+
+# for (idx in 2:7) {
+for (idx in 1:1) {}
+    ct <- celltypes[idx]
+    print(ct)
+
+
+ 
+    path_seurat <- glue("data/{ct}.RDS")
+
+    seurat <- readRDS(path_seurat)
+    # library(SeuratDisk)
+    # seurat <- LoadH5Seurat(path_seurat)
+    
+    DefaultAssay(seurat) <- "ADT"
+    seurat <- NormalizeData(seurat, normalization.method = 'CLR', margin = 2)
+
+
+    # Saving celltype information as column named celltype
+    # In order to use subset function later
+    # seurat$celltype <- seurat@meta.data[col_celltype]
+    
+    # Fill in the list of genes you are interested in calculating correlations for
+    corr_genes_all <- read.csv("protein_gene_map.csv")$protein
+    corr_genes_all <- corr_genes_all[corr_genes_all %in% rownames(seurat[["ADT"]])]
+
+    # as.data.frame(corr_genes_all)
+    
+    # seurat_all <- seurat
+    # seurat_all["SCT"] <- NULL
+
+    # seurat <- subset(seurat_all, celltype == ct)
+    
+    assay_ <- "ADT"
+    # Compute spearman correlation for each method (except CS-CORE which is run later)
+    # Unique combination of each gene pair
+    genes_comb <- data.frame(t(combn(corr_genes_all, 2)))
+    n_comb <- nrow(genes_comb)
+
+    # Create dataframe with correlation and p-values scores
+    df_corr <- genes_comb %>% rename("Var1" = X1, "Var2" = X2)
+    df_corr["ADT"] <- NA
+    df_p_val <- df_corr
+
+    for (idx in 1:n_comb) {
+
+        if (idx %% 200 == 0) {
+            print(glue("{idx}/{n_comb} correlations computed."))
+        }
+
+        # Name of genes to run correlation on
+        gene_1 <- genes_comb[idx, 1]
+        gene_2 <- genes_comb[idx, 2]
+
+      gene_exp <- FetchData(seurat, assay="ADT", layer="data", c(gene_1, gene_2))
+      
+      if (all(gene_exp[[gene_1]] == 0) | all(gene_exp[[gene_2]] == 0)) {
+          # If a gene has no expression, set correlation = 0 and p-value = 1
+          corr_val <- 0.0
+          p_val <- 1.0
+      } else {
+          # Calculate spearman correlation and p-value otherwise
+          tmp <- cor.test(gene_exp[[gene_1]], gene_exp[[gene_2]], method = "spearman", exact = FALSE)
+          corr_val <- as.numeric(unname(tmp$estimate))
+          p_val <- as.numeric(tmp$p.value)
+      }
+  
+      # Store correlation and p-values
+      df_corr[idx, assay_] <- corr_val
+      df_p_val[idx, assay_] <- p_val
+      }
+  
+      write.csv(df_corr, glue("results/corr_protein_2/corr_{ct}.csv"))
+      write.csv(df_p_val, glue("results/corr_protein_2/p_corr_{ct}.csv"))
+  
+      print("\n")
+}
+```

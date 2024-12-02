@@ -1,0 +1,347 @@
+---
+title: "Compare correlation scores: Unfiltered:"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+
+library(tidyverse)
+library(glue)
+library(ggpubr)
+library(Seurat)
+```
+
+# Overview
+
+This report will be a comprehensive evaluation of the different methods used to calculate correlations on the large CITE-seq dataset. As there is matched protein expression for all of these cells, we will be comparing the results against the protein correlation scores as our "ground truth". However, we must also bear in mind that protein expression is not always the same as RNA expression.
+
+The different methods are labeled as such:
+
+- RNA: Spearman correlation on log-normalized matrix
+- SCT: Spearman correlation on SCT transformed matrix
+- MAGIC: Spearman correlation on MAGIC imputed matrix
+- SAVER: Spearman correlation on SAVER imputed matrix
+- CSCORE: CS-CORE co-expression estimates 
+- ADT: Spearman correlation on protein expression 
+- rm_dropout: Spearman correlation on log-normalized matrix after removing cells that have 0 counts for both genes in the pair
+
+This is the unfiltered version of the report, where the correlations are calculated for every gene - regardless of expression or percent cells the gene is expressed in.
+
+# Protein correlations
+
+First we need to calcuate our ground truth values by calculating Spearman correlations on the CLR normalized protein expression in the dataset. 
+
+As an example, here I am showing the protein expression for CD19 and CD20 in B cells and showing the spearman correlation calculated from these normalized values:
+
+```{r}
+seurat <- readRDS("data/B.RDS")
+seurat <- NormalizeData(seurat, normalization.method = 'CLR', margin = 2, assay="ADT")
+
+protein_exp <- FetchData(seurat, c("adt_CD19", "adt_CD20"))
+
+ggplot(protein_exp, aes(x=adt_CD19, y=adt_CD20)) +
+  geom_point() +
+  theme_classic() +
+  stat_cor(method="spearman", label.y.npc="top", 
+           label.x.npc = "left", color="red") +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  ggtitle("Protein expression correlations")
+```
+
+# Remove dropout correlations
+
+```{r}
+# This dataset only came with ADT and SCT assays
+# The raw counts were stored in the "counts" slot of the SCT assay
+raw_rna <- GetAssayData(object =  seurat[['SCT']], layer = 'counts')
+seurat[["RNA"]] <- CreateAssayObject(counts = raw_rna)
+seurat <- NormalizeData(seurat, assay = "RNA")
+```
+
+One question that we asked was, what would happen if we were to remove the cells with dropout (0 expression for one gene in the pair) from the correlation calculation? Would we be able to use the log-normalized expression for these calculations after this filtration? To answer these questions, we will continue to look at the trends in doing so and how it compares to the protein correlations and concordance with other methods.
+
+Here I am showing an example using B cells for genes CD19 and CD79A, showing what happens when we remove the dropout from the spearman correlation calculation.
+
+```{r}
+gene_1 <- "CD19"
+gene_2 <- "CD79A"
+
+DefaultAssay(seurat) <- "RNA"
+gene_exp <- FetchData(seurat, assay="RNA", layer="data", vars=c(gene_1, gene_2))
+
+p1 <- ggplot(gene_exp, aes(x=CD19, y=CD79A)) +
+      geom_point() +
+      theme_classic() +
+      stat_cor(method="spearman", label.y.npc="top", 
+               label.x.npc = "left", color="red") +
+      geom_abline(slope = 1, intercept = 0, color = "red") +
+      ggtitle("With dropout")
+
+
+gene_exp <- gene_exp %>% subset((get(gene_1) > 0) & (get(gene_2) > 0))
+p2 <- ggplot(gene_exp, aes(x=CD19, y=CD79A)) +
+      geom_point() +
+      theme_classic() +
+      stat_cor(method="spearman", label.y.npc="top", 
+               label.x.npc = "left", color="red") +
+      geom_abline(slope = 1, intercept = 0, color = "red") +
+      ggtitle("Remove dropout")
+
+p1 + p2
+```
+
+# Loading in dataset
+
+The workflow generates a dataframe called `corr_{celltype}.csv` which we can read in to compare how each of the methods do compared to one another. As a reminder, these correlations are calculated on a per-celltype basis.
+
+I have also separately generated the correlation scores after removing dropout and for the protein expression data. Here I am merging together all of the results in one dataframe to contrast the results. 
+
+
+```{r}
+files <- list.files("results/corr_protein_2/", pattern="^corr.*csv")
+
+df_corr <- list()
+
+for (file in files) {
+  
+  impute_corr <- read.csv(glue("results/corr_workflow/{file}"), row.names=1)
+  protein_corr <-  read.csv(glue("results/corr_protein/{file}"), row.names=1)
+  rm_dropout <- read.csv(glue("results/rm_dropout_2/{file}"), row.names=1)
+
+  df <- left_join(impute_corr, protein_corr, by=c("Var1", "Var2"))
+  df <- left_join(df, rm_dropout, by=c("Var1", "Var2"))
+
+  ct <- str_replace(file, "corr_", "")
+  ct <- str_replace(ct, ".csv", "")
+  df$celltype <- ct
+
+  df_corr[[ct]] <- df
+}
+
+df_corr <- bind_rows(df_corr)
+df_corr
+```
+
+```{r}
+# Removing other T since it is a vague category
+df_corr <- df_corr %>% subset(celltype != "other T")
+```
+
+Note that for this report, I have included all genes (without filtering) to see how well the methods work for poorly expressed genes. There is another, identical report that will show these results when filtering out genes that do not meet the thresholded values. 
+
+# Distribution of correlation scores
+
+Here I wanted to display the summary statistics as well as a histogram of the correlation scores for each method. The range in which the correlation scores fall varies depending on the method to get a better sense of the overal trends in the data.
+
+## Log-normalization correlations
+
+Spearman correlations on the log-normalized expression matrix.
+
+```{r}
+summary(df_corr$RNA)
+```
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr) +
+  geom_histogram(aes(x=RNA, fill=celltype)) +
+  xlim(-1, 1) +
+  theme_classic() +
+  facet_wrap(~celltype, ncol=3)
+```
+
+## SCT correlations
+
+Spearman correlations on the SCT normalized expression matrix.
+
+
+```{r}
+summary(df_corr$SCT)
+```
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr) +
+  geom_histogram(aes(x=SCT, fill=celltype), bins=50) +
+  xlim(-1, 1) +
+  theme_classic() +
+  scale_y_log10() +
+  facet_wrap(~celltype, ncol=3)
+```
+
+
+## MAGIC correlations
+
+Spearman correlations on the MAGIC imputed expression matrix.
+
+
+```{r}
+summary(df_corr$MAGIC)
+```
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr) +
+  geom_histogram(aes(x=MAGIC, fill=celltype), bins=50) +
+  xlim(-1, 1) +
+  theme_classic() +
+  scale_y_log10() +
+  facet_wrap(~celltype, ncol=3)
+```
+
+## SAVER correlations
+
+Spearman correlations on the SAVER imputed expression matrix.
+
+
+```{r}
+summary(df_corr$SAVER)
+```
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr) +
+  geom_histogram(aes(x=SAVER, fill=celltype), bins=50) +
+  xlim(-1, 1) +
+  theme_classic() +
+  scale_y_log10() +
+  facet_wrap(~celltype, ncol=3)
+```
+
+## CS-CORE correlations
+
+CS-CORE co-expression estimates calculated on the raw RNA counts matrix.
+
+
+```{r}
+summary(df_corr$CSCORE)
+```
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr) +
+  geom_histogram(aes(x=CSCORE, fill=celltype), bins=50) +
+  xlim(-1, 1) +
+  theme_classic() +
+  scale_y_log10() +
+  facet_wrap(~celltype, ncol=3)
+```
+
+## Protein correlations
+
+Spearman correlations calculated on the CLR normalized protein expression matrix.
+
+```{r}
+summary(df_corr$ADT)
+```
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr) +
+  geom_histogram(aes(x=ADT, fill=celltype), bins=50) +
+  xlim(-1, 1) +
+  theme_classic() +
+  scale_y_log10() +
+  facet_wrap(~celltype, ncol=3)
+```
+
+## rm_dropout correlations
+
+Spearman correlations on log-normalized RNA expression after removing cells that have 0 expression for both cells.
+
+```{r}
+summary(df_corr$rm_dropout)
+```
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr) +
+  geom_histogram(aes(x=rm_dropout, fill=celltype), bins=50) +
+  xlim(-1, 1) +
+  theme_classic() +
+  scale_y_log10() +
+  facet_wrap(~celltype, ncol=3)
+```
+
+# Notes on correlation distributions
+
+In line with previous results, we see that the correlation scores for log-normalization and SCT primarily are 0 due to the high levels of dropout.
+
+MAGIC skews more positive, which higher correlation scores after imputation.
+
+SAVER and CS-CORE shows a wider spread of both negative and positive correlations. However, in CS-CORE there are fewer counts as you tend towards higher correlation scores (values are less extreme).
+
+The protein correlation scores appear similar to CS-CORE in that there are not as many "extreme" (-1 or 1) values.
+
+After removing cells with "dropout", the majority of correlations tend to be slighly positive, which could be attributed to the fact that there is some expression of both genes for all the correlations.
+
+# Comparing protein correlations
+
+Now that we have the results for each method, we can begin comparing the correlation scores across each method against the correlations for protein expression (ADT). While there may not be a one-to-one comparison between these values, ideally we would like to see general agreement between the two from the pearson correlation score.
+
+## Protein vs SAVER
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr, aes(x=ADT, y=SAVER, color=celltype)) +
+  geom_point() +
+  ylim(-1, 1) + xlim(-1, 1) +
+  theme_classic() +
+  geom_abline(slope = 1, intercept = 0, color = "black") +
+  stat_cor(method="pearson", label.y.npc="top", label.x.npc = "left", color="black") +
+  facet_wrap(~celltype, ncol=3)
+```
+
+
+## Protein vs CS-CORE
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr, aes(x=ADT, y=CSCORE, color=celltype)) +
+  geom_point() +
+  ylim(-1, 1) + xlim(-1, 1) +
+  theme_classic() +
+  geom_abline(slope = 1, intercept = 0, color = "black") +
+  stat_cor(method="pearson", label.y.npc="top", label.x.npc = "left", color="black") +
+  facet_wrap(~celltype, ncol=3)
+```
+
+## Protein vs MAGIC
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr, aes(x=ADT, y=MAGIC, color=celltype)) +
+  geom_point() +
+  ylim(-1, 1) + xlim(-1, 1) +
+  theme_classic() +
+  geom_abline(slope = 1, intercept = 0, color = "black") +
+  stat_cor(method="pearson", label.y.npc="top", label.x.npc = "left", color="black") +
+  facet_wrap(~celltype, ncol=3)
+```
+
+## Protein vs rm_dropout
+
+```{r fig.height=9, fig.width=9}
+ggplot(df_corr, aes(x=ADT, y=rm_dropout, color=celltype)) +
+  geom_point() +
+  ylim(-1, 1) + xlim(-1, 1) +
+  theme_classic() +
+  geom_abline(slope = 1, intercept = 0, color = "black") +
+  stat_cor(method="pearson", label.y.npc="top", label.x.npc = "left", color="black") +
+  facet_wrap(~celltype, ncol=3)
+```
+
+# Notes on protein correlation comparisons
+
+We have to bear in mind that protein expression ultimately may differ from gene expression, resulting in some differences in correlations scores. With that being said, the results from CS-CORE generally align most closely with the correlations from protein expression among the methods test. However, the SAVER scores are not too dissimilar to the CS-CORE results, which is in line with our previous results that CS-CORe and SAVER methods tend to generally agree.
+
+While the MAGIC results also give similar correlation scores, it is important to note that almost all the MAGIC correlation scores go above the y=x line, showing the trend of mostly positive scores that are not in line with what is expected biologically.
+
+# Notes on removing dropout
+
+We can see that just removing cells with no expression of the genes of interest results in primarily negative correlation scores. This is due to the fact that we are removing a significant number of cells in this process. The resulting values do not correspond well with the protein correlations or the other methods we have been testing. Additionally, using this approach is only viable when working with many cells, where you can spare the loss of cells in the calculation.
