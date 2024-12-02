@@ -1,8 +1,9 @@
 You can re-create the conda environments that was used for all these analyses with the following command:
 
+```
 conda create -n merck R=4.3.2
 conda install --file requirements.txt
-
+```
 
 Each of the folders within this repository refers to a different dataset that was used for this correlation analysis.
 
