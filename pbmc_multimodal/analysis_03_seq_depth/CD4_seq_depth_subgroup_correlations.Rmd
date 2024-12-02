@@ -1,0 +1,406 @@
+---
+title: "Correlation workflow"
+author: "Noor Sohail"
+output:
+   html_document:
+      code_folding: hide
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      self_contained: true
+      theme: default
+      toc: true
+      toc_float:
+         collapsed: true
+         smooth_scroll: true
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Turn off Warnings and other console output messages from the whole document
+```
+
+```{r}
+library(reticulate)
+use_condaenv("merck")
+```
+
+```{r, cache=FALSE, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(glue)
+library(Seurat)
+library(pheatmap)
+library(devtools)
+library(gridExtra)
+library(RColorBrewer)
+
+library(ggpubr)
+
+ggplot2::theme_set(theme_light(base_size = 11))
+opts_chunk[["set"]](
+    cache = FALSE,
+    dev = c("png", "pdf"),
+    error = TRUE,
+    highlight = TRUE,
+    message = FALSE,
+    prompt = FALSE,
+    tidy = FALSE,
+    warning = FALSE)
+```
+
+# User define values
+
+```{r}
+path_seurat <- "data/CD4 T.RDS"
+path_outs <- "results/"
+
+## add column names for the sample id and the celltype column. ct is the cluster/celltype that you want to focus on. Replace with your information that match seurat object.
+col_sample <- "donor"
+col_celltype <- "celltype"
+ct <- "CD4 T"
+
+# Filtration parameters
+filter <- FALSE
+min_exp <- 0.2
+min_cells <- 40
+min_perc <- 0.2
+```
+
+- Path seurat: `r path_seurat`
+- Metadata column with celltypes: `r col_celltype`
+- Celltype to subset to: `r ct`
+- Filter genes based on expression and frequency: `r filter`
+
+List of all genes:
+```{r}
+# Fill in the list of genes you are interested in calculating correlations for
+# corr_genes_all <- c("CD3D", "CD3E", "CXCR4", "IL7R", "LTB", "TRBC2", "CCR4", "CCR6", "CD4", "TCF7", "BCL11B", "TMSB10", "PTPRC", "CD14", "CD19", "CD38", "CD69", "CXCR3")
+corr_genes_all <- c("CD3D", "CD3E", "CXCR4", "IL7R", "LTB", "TRBC2", "CCR4", "CCR6", "CD4", "TCF7", "BCL11B", "TMSB10", "PTPRC", "CD14", "CD19", "CD38", "CD69", "CXCR3", "AC011933.3", "FRMD5", "LINC00629", "C1orf54", "NPL", "RWDD3", "RPS12", "RPS27", "MALAT1")
+
+as.data.frame(corr_genes_all)
+```
+
+Starting off with `r length(corr_genes_all)` genes of interest.
+
+# Load seurat object
+
+```{r}
+seurat <- readRDS(path_seurat)
+raw_rna <- GetAssayData(object =  seurat[['SCT']], layer = 'counts')
+seurat[["RNA"]] <- CreateAssayObject(counts = raw_rna)
+seurat <- NormalizeData(seurat, assay = "RNA")
+
+# Saving celltype information as column named celltype
+# In order to use subset function later
+seurat$celltype <- seurat@meta.data[col_celltype]
+```
+
+```{r}
+Idents(seurat) <- "donor"
+```
+
+```{r}
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = get(col_celltype),
+            fill = get(col_celltype)),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        xlab("Celltype") +
+        ylab("Number of Cells") +
+        ggtitle("Celltypes") +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = get(col_celltype), label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Subset to `r ct` cells
+
+```{r}
+seurat <- subset(seurat, celltype == ct)
+
+## Set default assay to RNA, downstream code fails if it is on SCT. Remove SCT as well
+DefaultAssay(object = seurat) <- "RNA"
+# seurat[['SCT']] <- NULL # to make sure it doesn't fail downstream due to new version of Seurat
+n_cells <- ncol(seurat)
+```
+
+Working with `r n_cells` cells.
+
+```{r}
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = get(col_sample),
+            fill = get(col_sample)),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        ggtitle(glue("{ct} cells: Sample distribution")) +
+        ylab("Number of Cells") +
+        xlab("Sample") +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = get(col_sample), label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Selecting extra genes as negative controls
+
+The genes selected so far are CD4 T cells marker genes and are being used as positive controls for this analysis.
+
+
+Next I am going to select some genes based upon the average expression, selecting genes in each quantile.
+
+```{r}
+gene_avg <- rowMeans(seurat[["RNA"]]$data)
+gene_avg <- gene_avg[corr_genes_all] %>% sort()
+gene_avg
+```
+
+# Subset genes of interest
+
+From the genes that were supplied, removing any that are not expressed in this dataset.
+
+```{r}
+corr_genes <- corr_genes_all[corr_genes_all %in% rownames(seurat)]
+as.data.frame(corr_genes)
+```
+
+Next we look at the basic distribution of remaining genes of interest in terms of expression and number of cells they are expressed in.
+
+These are the following filtration metrics that are set:
+
+- Average expression < `r min_exp`
+- Number of cells expressed in > `r min_cells`
+- Percentage of cells expressed in > `r min_perc`
+
+Filtration parameter was set to `r filter`. If FALSE, no further filtration will be done at this step.
+
+```{r}
+data_rna <- FetchData(seurat[["RNA"]], vars = corr_genes)
+
+# Number of cells a gene is expressed in
+num_cells <- colSums(data_rna > 0)
+# Percentage of cells a gene is expressed in
+perc_cells <- num_cells / ncol(seurat)
+# Average expression of a gene
+avg_expression <- colMeans(data_rna)
+
+df_genes <- data.frame(num_cells, perc_cells, avg_expression)
+df_genes <- df_genes %>% mutate(filter = !((perc_cells > min_perc) & (num_cells > min_cells) & (avg_expression > min_exp)))
+df_genes$gene <- row.names(df_genes)
+df_genes <- df_genes %>% arrange(desc(avg_expression), desc(perc_cells))
+
+df_genes
+```
+
+```{r}
+df_genes %>% ggplot() +
+    geom_point(aes(x = perc_cells, y = avg_expression, color = filter)) +
+    theme_classic()
+```
+
+```{r}
+if (filter == TRUE) {
+    corr_genes <- (df_genes %>% subset(filter == FALSE))$gene
+}
+```
+
+`r length(corr_genes)` genes of interest remaining.
+
+
+# Group cells by library size
+
+Grouping together cells based upon their total expression value to then calculate correlations among those groups. Here we see the different groups based on 10 quantiles.
+
+```{r}
+groups <- c("group_1", "group_2", "group_3", "group_4", "group_5", "group_6", "group_7", "group_8", "group_9",  "group_10")
+groups <- factor(groups, levels=groups)
+
+qts <- quantile(seurat@meta.data$nCount_RNA, probs=seq(0, 1, 0.1))
+qts
+```
+
+```{r}
+seurat$depth_group <- NA
+for (idx in 1:10) {
+  group <- glue("group_{idx}")
+  
+  qt1 <- qts[idx]
+  qt2 <- qts[idx + 1]
+  
+  idx_cells <- seurat@meta.data %>% subset((nCount_RNA >= qt1) & (nCount_RNA <= qt2)) %>% rownames()
+  seurat@meta.data[idx_cells, "depth_group"] <- group
+}
+
+seurat$depth_group <- factor(seurat$depth_group, levels=groups)
+```
+
+
+```{r}
+ggplot(seurat@meta.data) +
+  geom_histogram(aes(x=nCount_RNA, fill=depth_group), bins=100) +
+  scale_x_log10() +
+  theme_classic()
+```
+
+
+```{r}
+seurat@meta.data %>%
+        ggplot() +
+        geom_bar(aes(
+            x = depth_group,
+            fill = depth_group),
+            stat = "count", color = "black") +
+        theme_classic() +
+        NoLegend() +
+        ggtitle(glue("{ct} cells")) +
+        ylab("Number of Cells") +
+        xlab("Sample") +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        geom_text(aes(x = depth_group, label = after_stat(count)), stat = "count", vjust = -0.5) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r fig.width=15}
+Idents(seurat) <- "depth_group"
+DotPlot(seurat, corr_genes_all) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+# Calculate correlations within groups
+
+```{r}
+depth <- seurat@meta.data[c("nCount_RNA", "depth_group")]
+
+seurat <- readRDS("data/imputed_CD4 T.RDS")
+seurat$nCount_RNA <- depth$nCount_RNA
+seurat$depth_group <- depth$depth_group
+```
+
+
+```{r}
+# Compute spearman correlation for each method (except CS-CORE which is run later)
+# Unique combination of each gene pair
+genes_comb <- data.frame(t(combn(corr_genes, 2)))
+n_comb <- nrow(genes_comb)
+
+df_corr_list <- list()
+df_p_val_list <- list()
+
+assays <- c("RNA", "SCT", "MAGIC", "SAVER")
+for (assay_ in assays) {
+
+  # Create dataframe with correlation and p-values scores
+  df_corr <- genes_comb %>% rename("Var1" = X1, "Var2" = X2)
+  df_corr[levels(groups)] <- NA
+  df_p_val <- df_corr
+
+  for (idx in 1:n_comb) {
+
+      if (idx %% 100 == 0) {
+          print(glue("{assay_}: {idx}/{n_comb} correlations computed."))
+      }
+
+      # Name of genes to run correlation on
+      gene_1 <- genes_comb[idx, 1]
+      gene_2 <- genes_comb[idx, 2]
+
+      for (group_ in groups) {
+        seurat_sub <- subset(seurat, subset = (depth_group == group_))
+        gene_exp <- t(seurat_sub[[assay_]]$data[c(gene_1, gene_2), ]) %>% as.data.frame()
+
+          if (all(gene_exp[[gene_1]] == 0) | all(gene_exp[[gene_2]] == 0)) {
+              # If a gene has no expression, set correlation = 0 and p-value = 1
+              corr_val <- 0.0
+              p_val <- 1.0
+          } else {
+              # Calculate spearman correlation and p-value otherwise
+              tmp <- cor.test(gene_exp[[gene_1]], gene_exp[[gene_2]],
+                              method = "spearman", exact = FALSE)
+              corr_val <- as.numeric(unname(tmp$estimate))
+              p_val <- as.numeric(tmp$p.value)
+          }
+
+          # Store correlation and p-values
+          df_corr[idx, group_] <- corr_val
+          df_p_val[idx, group_] <- p_val
+      }
+  }
+
+  df_corr_list[[assay_]] <- df_corr
+  df_p_val_list[[assay_]] <- df_p_val
+
+}
+
+saveRDS(df_corr_list, "results/CD4_seqDepth_subset.RDS")
+```
+
+```{r}
+# Create dataframe with correlation and p-values scores
+df_corr <- genes_comb %>% rename("Var1" = X1, "Var2" = X2)
+df_p_val <- df_corr
+
+for (group_ in groups) {
+  seurat_sub <- subset(seurat, subset = (depth_group == group_))
+
+  # Run CS-CORE
+  DefaultAssay(seurat_sub) <- "RNA"
+  CSCORE_result <- CSCORE(seurat_sub, genes=corr_genes)
+
+  # Store CS-CORE results
+  tmp <- reshape2::melt(as.matrix(CSCORE_result$est))
+  idx_col <- which(colnames(tmp) == "value")
+  colnames(tmp)[idx_col] <- group_
+
+  df_corr <- left_join(df_corr, tmp)
+}
+
+df_corr_list[["CSCORE"]] <- df_corr
+saveRDS(df_corr_list, "results/CD4_seqDepth_subset.RDS")
+```
+
+# Results
+
+```{r}
+df_corr_list <- readRDS("results/CD4_seqDepth_subset.RDS")
+```
+
+```{r results="asis"}
+methods <- names(df_corr_list)
+
+for (method in methods) {
+  cat(paste("##", method, "\n\n"))
+  
+  df <- df_corr_list[[method]] %>% select(groups)
+  
+  if (method == "SAVER") {
+    p <- pheatmap(df, cluster_cols=FALSE, cluster_rows=FALSE, show_rownames = FALSE, main=method, silent=FALSE, na_col = "grey90")
+  } else {
+    p <- pheatmap(df, cluster_cols=FALSE, show_rownames = FALSE, main=method, silent=FALSE, na_col = "grey90")
+  }
+  
+  knit_print(p)
+  cat("\n\n")
+  
+  df <- transform(df, SD=apply(df,1, sd, na.rm = TRUE))
+  p <- ggplot(df, aes(x=SD)) +
+    geom_histogram(bins=50)
+  knit_print(p)
+  cat("\n\n")
+  
+  p <- ggplot(df, aes(x=group_1, y=group_10, color=SD)) +
+    geom_point() +
+    scale_colour_viridis_c() +
+    theme_classic() +
+    xlim(-1, 1) + ylim(-1, 1) +
+    geom_abline(slope = 1, intercept = 0, color = "red") +
+    stat_cor(method="pearson", label.y.npc="top", label.x.npc = "left", color="red") +
+    ggtitle(method)
+  knit_print(p)
+  cat("\n\n")
+}
+```
